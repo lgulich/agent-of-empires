@@ -443,6 +443,12 @@ pub const AGENTS: &[AgentDef] = &[
         // by Claude/Cursor/Gemini, so hook_config: None and install is
         // special-cased like hermes/settl. Status comes from the hook sidecar
         // file written by install_kiro_hooks; the pane stub is unused.
+        //
+        // Kiro CLI does not currently emit a tool-approval / permission-request
+        // hook event (only agentSpawn, userPromptSubmit, preToolUse,
+        // postToolUse, stop), so we cannot surface a distinct `waiting` status
+        // for Kiro sessions blocked on tool approval. See KIRO_HOOKS in
+        // src/hooks/mod.rs and AoE issue #961.
         hook_config: None,
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         host_only: false,
