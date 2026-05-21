@@ -133,6 +133,7 @@ Coverage runs on every PR via the merge of Vitest + Playwright LCOVs (see `web/s
 
 - Do not modify git configuration (e.g., `.gitconfig`, `.git/config`, `git config` commands) without explicit user approval.
 - The one exception: adding a new remote to fetch a contributor's fork during PR code review is allowed without asking.
+- **Never run `git worktree prune`**, even to clean up your own temp worktrees. To remove a temp worktree, `rm -rf <path>` is sufficient; leave the stale `.git/worktrees/<name>/` admin entry alone. Sandboxed agents see registered worktrees tagged `prunable` because the host's registered path is unreachable from inside the mount, and `git worktree prune` will destroy the admin metadata of healthy worktrees indiscriminately.
 
 ## Local Data & Configuration Tips
 
