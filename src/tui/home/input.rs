@@ -1769,6 +1769,15 @@ impl HomeView {
             KeyCode::Char('>') => {
                 self.grow_list();
             }
+            // `i`/`I`: toggle the preview info header (profile/tool/path/
+            // status/sandbox/worktree). Persisted across runs. The hint
+            // rendered on the outer Preview block title advertises this.
+            KeyCode::Char('i') if !self.strict_hotkeys => {
+                self.toggle_preview_info();
+            }
+            KeyCode::Char('I') if self.strict_hotkeys => {
+                self.toggle_preview_info();
+            }
             // Bare `h` collapses only in strict mode; in non-strict the
             // earlier `Char('h') if !self.strict_hotkeys` arm catches it
             // for Snooze, so we'd never reach here. Pairing it with Left
