@@ -4,6 +4,16 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.9.2](https://github.com/njbrake/agent-of-empires/releases/tag/v1.9.2) - 2026-05-26
+
+
+
+### Bug Fixes
+
+- **tui:** Keep live-mode entry frame from rendering shifted up in [#1521](https://github.com/njbrake/agent-of-empires/pull/1521) by [@njbrake](https://github.com/njbrake) ([`6bf747c`](https://github.com/njbrake/agent-of-empires/commit/6bf747cdad18481cc8d0b885e64e58ec5fea7c46))
+
+
+**Full Changelog**: https://github.com/njbrake/agent-of-empires/compare/v1.9.1...v1.9.2
 ## [1.9.1](https://github.com/njbrake/agent-of-empires/releases/tag/v1.9.1) - 2026-05-26
 
 
