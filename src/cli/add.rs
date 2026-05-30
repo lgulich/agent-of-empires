@@ -623,16 +623,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     let should_trust = if args.trust_hooks {
                         true
                     } else {
-                        println!("\nRepository hooks detected in .agent-of-empires/config.toml:");
-                        if !hooks.on_create.is_empty() {
-                            println!("  on_create:");
-                            for cmd in &hooks.on_create {
-                                println!("    {}", cmd);
-                            }
-                        }
-                        if !hooks.on_launch.is_empty() {
-                            println!("  on_launch:");
-                            for cmd in &hooks.on_launch {
+                        // Show the final merged set (repo overrides global/profile
+                        // per type) with source labels, mirroring the TUI trust
+                        // dialog, so the prompt reflects exactly what will run (#596).
+                        println!(
+                            "\nHooks for this session (repo overrides global config per type):"
+                        );
+                        let merged = repo_config::merge_hooks_for_display(profile, &hooks);
+                        for group in repo_config::hook_display_groups(&merged, &hooks, true) {
+                            println!("  {}:{}", group.name, group.source_label());
+                            for cmd in &group.commands {
                                 println!("    {}", cmd);
                             }
                         }
@@ -668,7 +668,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
-                println!("Running on_create hooks...");
+                // Show the final merged hook list (repo hooks override global/profile
+                // per type) so the user can see exactly what runs, especially when
+                // `--trust-hooks` skipped the interactive approval prompt (#596).
+                println!("Running on_create hooks:");
+                for cmd in &hooks.on_create {
+                    println!("  {}", cmd);
+                }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
                 repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 println!("✓ on_create hooks completed");
