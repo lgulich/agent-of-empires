@@ -1585,6 +1585,14 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<LaunchSidOutcome> {
+        // Validate before any shell-command construction in
+        // `build_launch_command` (covers `status_hook_env_prefix` and
+        // the sandbox docker_args interpolation). Runs before the
+        // cockpit short-circuit so a tampered id surfaces as `Err` for
+        // cockpit sessions too.
+        crate::session::validate_instance_id(&self.id)
+            .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
+
         // Cockpit-mode sessions are not backed by tmux. The cockpit
         // worker supervisor spawns the ACP agent process directly;
         // calling start() on a cockpit session is a no-op (status
@@ -1627,8 +1635,9 @@ impl Instance {
         );
 
         if self.tool == "claude" {
-            let sidecar = crate::hooks::hook_status_dir(&self.id).join("session_id");
-            let _ = std::fs::remove_file(&sidecar);
+            if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
+                let _ = std::fs::remove_file(dir.join("session_id"));
+            }
         }
 
         session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
@@ -2769,7 +2778,9 @@ impl Instance {
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
 
         self.agent_session_id = None;
-        let _ = std::fs::remove_file(crate::hooks::hook_status_dir(&self.id).join("session_id"));
+        if let Ok(dir) = crate::hooks::hook_status_dir(&self.id) {
+            let _ = std::fs::remove_file(dir.join("session_id"));
+        }
         // Populate the poller exclusion before calling
         // `clear_session_for_resume_fallback` so its `Failed` bail
         // still keeps the bad sid out of the next retroactive capture
@@ -5721,7 +5732,8 @@ mod tests {
         }
 
         fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
-            let dir = crate::hooks::hook_status_dir(instance_id);
+            let dir =
+                crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("session_id"), sid).unwrap();
             dir
@@ -6763,6 +6775,32 @@ mod tests {
             }
             assert!(inst.retroactive_capture_excludes.contains(&stale_sid));
             assert!(inst.agent_session_id.as_deref() != Some(stale_sid.as_str()));
+        }
+    }
+
+    fn instance_with_id(id: &str) -> Instance {
+        let mut inst = Instance::new("tampered-id-test", "/tmp");
+        inst.id = id.to_string();
+        inst
+    }
+
+    #[test]
+    fn start_with_size_opts_rejects_tampered_instance_id() {
+        for poisoned in ["; rm -rf $HOME #", "../etc", ""] {
+            let mut instance = instance_with_id(poisoned);
+            let result = instance.start_with_size_opts(None, false);
+            let err = match result {
+                Ok(_) => panic!("must refuse tampered id at launch (id={poisoned:?})"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("AOE_INSTANCE_ID"),
+                "error must surface validator failure for id={poisoned:?}, got: {err}"
+            );
+            assert!(
+                !instance.tmux_session().map(|s| s.exists()).unwrap_or(false),
+                "no tmux session must exist after refusal for id={poisoned:?}"
+            );
         }
     }
 }
