@@ -5859,6 +5859,71 @@ mod tests {
         assert!(classify_rate_limit_from_message("connection refused").is_none());
     }
 
+    #[test]
+    fn classify_provider_auth_invalid_recognises_data_reason() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "API key expired. Please renew the API key.".into();
+        err.data = Some(serde_json::json!({ "reason": "API_KEY_INVALID" }));
+        let info = classify_provider_auth_invalid_error(&err).expect("classified");
+        assert_eq!(info.reason.as_deref(), Some("API_KEY_INVALID"));
+        assert!(info.status.contains("renew the API key"));
+    }
+
+    #[test]
+    fn classify_provider_auth_invalid_recognises_nested_error_status() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "request failed".into();
+        err.data = Some(serde_json::json!({ "error": { "status": "API_KEY_INVALID" } }));
+        let info = classify_provider_auth_invalid_error(&err).expect("classified");
+        assert_eq!(info.reason.as_deref(), Some("API_KEY_INVALID"));
+    }
+
+    #[test]
+    fn classify_provider_auth_invalid_matches_message_fingerprint() {
+        // No structured data: the verbatim Gemini phrasing alone matches,
+        // with no token recoverable for the reason.
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "API key expired. Please renew the API key.".into();
+        let info = classify_provider_auth_invalid_error(&err).expect("classified");
+        assert_eq!(info.reason, None);
+
+        // The structured token embedded in the message is recovered.
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "Error generating content: API_KEY_INVALID".into();
+        let info = classify_provider_auth_invalid_error(&err).expect("classified");
+        assert_eq!(info.reason.as_deref(), Some("API_KEY_INVALID"));
+    }
+
+    #[test]
+    fn classify_provider_auth_invalid_shadows_rate_limit() {
+        // A rate-limit error that incidentally mentions an API key must
+        // stay a rate-limit, never an auth failure.
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "API key invalid? no: rate limited".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        assert!(classify_provider_auth_invalid_error(&err).is_none());
+        assert!(classify_rate_limit_error(&err).is_some());
+    }
+
+    #[test]
+    fn classify_provider_auth_invalid_ignores_unrelated_errors() {
+        // Bare auth/login words are deliberately not matched (they overlap
+        // retryable OAuth refresh flows).
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "please authenticate before continuing; try to login".into();
+        assert!(classify_provider_auth_invalid_error(&err).is_none());
+
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "transport closed".into();
+        assert!(classify_provider_auth_invalid_error(&err).is_none());
+
+        // A non-invalid-key structured status is not parked.
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "permission denied".into();
+        err.data = Some(serde_json::json!({ "reason": "PERMISSION_DENIED" }));
+        assert!(classify_provider_auth_invalid_error(&err).is_none());
+    }
+
     /// Sandboxed cockpit spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent

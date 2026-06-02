@@ -3220,6 +3220,79 @@ mod tests {
         );
     }
 
+    /// Reproduce-then-fix for #1712: a non-retryable provider auth
+    /// failure (`Stopped { reason: "provider_auth_invalid" }`) must be
+    /// treated like rate-limit, not a crash. The drain task drops the
+    /// worker handle without `restart_decision` (so restart budget is
+    /// never spent on respawning a worker that will hit the same bad
+    /// key) and emits no synthetic AgentStartupError. Before the fix the
+    /// reason was unknown to the drain task, so it fell through to the
+    /// crash-style respawn / budget-burn path.
+    #[tokio::test]
+    async fn drain_skips_restart_when_stopped_provider_auth_invalid() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let drain = sup.start_drain_task("s-auth".into(), inbound_rx);
+        {
+            let mut workers = sup.workers.lock().await;
+            let (client, _client_tx) = AcpClient::fake_for_test(CockpitSessionId("s-auth".into()));
+            workers.insert(
+                "s-auth".into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+        }
+
+        // Producer hands off the typed event then the terminal Stopped,
+        // exactly as the connection task does for a parked auth failure.
+        inbound_tx
+            .send(Event::ProviderAuthInvalid {
+                info: crate::cockpit::state::ProviderAuthInfo {
+                    status: "API key expired. Please renew the API key.".into(),
+                    reason: Some("API_KEY_INVALID".into()),
+                },
+            })
+            .await
+            .unwrap();
+        inbound_tx
+            .send(Event::Stopped {
+                reason: "provider_auth_invalid".into(),
+            })
+            .await
+            .unwrap();
+        drop(inbound_tx);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("drain task should exit within 2s of inbound close");
+
+        assert!(
+            !sup.workers.lock().await.contains_key("s-auth"),
+            "provider-auth-invalid worker handle must be dropped from the workers map"
+        );
+
+        let frames = sink.frames.lock().unwrap();
+        assert!(
+            frames.iter().any(|(_, _, ev)| matches!(
+                ev,
+                Event::Stopped { reason } if reason == "provider_auth_invalid"
+            )),
+            "the Stopped{{provider_auth_invalid}} signal must be published to the sink"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. })),
+            "no synthetic AgentStartupError should be emitted on provider auth-invalid"
+        );
+    }
+
     /// `Supervisor::shutdown` against an `Stdio` test fixture must NOT
     /// publish a `Stopped` event (the seq counter is shared with
     /// budget-tally tests; spurious publishes corrupt their assertions).

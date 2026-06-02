@@ -1410,4 +1410,40 @@ mod tests {
             "RateLimitAutoResumed must clear the rate-limit snapshot"
         );
     }
+
+    #[test]
+    fn provider_auth_invalid_sets_and_clears_on_successful_prompt() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ProviderAuthInvalid {
+            info: ProviderAuthInfo {
+                status: "API key expired. Please renew the API key.".into(),
+                reason: Some("API_KEY_INVALID".into()),
+            },
+        })
+        .unwrap();
+        assert!(
+            s.provider_auth_error.is_some(),
+            "ProviderAuthInvalid seeds the auth-error snapshot"
+        );
+
+        // A non-success terminal reason must NOT clear it (the key is only
+        // proven good by a successful turn, not by a respawn or cancel).
+        s.apply_event(Event::Stopped {
+            reason: "agent_unresponsive".into(),
+        })
+        .unwrap();
+        assert!(
+            s.provider_auth_error.is_some(),
+            "a non-prompt_complete Stopped must leave the auth banner in place"
+        );
+
+        s.apply_event(Event::Stopped {
+            reason: "prompt_complete".into(),
+        })
+        .unwrap();
+        assert!(
+            s.provider_auth_error.is_none(),
+            "a successful prompt_complete must clear the auth-error snapshot"
+        );
+    }
 }
