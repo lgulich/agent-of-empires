@@ -12,9 +12,12 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
+  // The project currently being edited, or null when adding / closed. The form
+  // modal opens when `showAdd` is true (add) or `editing` is set (edit).
+  const [editing, setEditing] = useState<ProjectInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Add-form state
+  // Form state, shared by the add and edit modes.
   const [path, setPath] = useState("");
   const [name, setName] = useState("");
   const [baseBranch, setBaseBranch] = useState("");
@@ -23,12 +26,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   const [showBrowser, setShowBrowser] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // Inline per-row base-branch edit state, keyed by `${scope}:${path}`.
-  const [editingKey, setEditingKey] = useState<string | null>(null);
-  const [editBranch, setEditBranch] = useState("");
-  const [savingEdit, setSavingEdit] = useState(false);
-
-  const projectKey = (p: ProjectInfo) => `${p.scope}:${p.path}`;
+  const isEdit = editing !== null;
+  const formOpen = (showAdd || isEdit) && !readOnly;
 
   const reload = async () => {
     setLoading(true);
@@ -40,6 +39,40 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   useEffect(() => {
     reload();
   }, []);
+
+  const resetForm = () => {
+    setPath("");
+    setName("");
+    setBaseBranch("");
+    setScope("global");
+    setAllowOverride(false);
+  };
+
+  const openAdd = () => {
+    setError(null);
+    resetForm();
+    setEditing(null);
+    setShowAdd(true);
+  };
+
+  const openEdit = (p: ProjectInfo) => {
+    setError(null);
+    setShowAdd(false);
+    setPath(p.path);
+    setName(p.name);
+    setBaseBranch(p.default_base_branch ?? "");
+    setScope(p.scope);
+    setAllowOverride(false);
+    setEditing(p);
+  };
+
+  const closeForm = () => {
+    setShowAdd(false);
+    setEditing(null);
+    setShowBrowser(false);
+    resetForm();
+    setError(null);
+  };
 
   const handleAdd = async () => {
     const trimmedPath = path.trim();
@@ -58,13 +91,25 @@ export function ProjectsView({ onClose, readOnly }: Props) {
       setError(result.error || "Add failed");
       return;
     }
-    setPath("");
-    setName("");
-    setBaseBranch("");
-    setScope("global");
-    setAllowOverride(false);
-    setShowAdd(false);
-    setShowBrowser(false);
+    closeForm();
+    await reload();
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editing) return;
+    setSubmitting(true);
+    setError(null);
+    const result = await updateProject(
+      editing.name,
+      editing.scope,
+      baseBranch.trim() || null,
+    );
+    setSubmitting(false);
+    if (!result.ok) {
+      setError(result.error || "Update failed");
+      return;
+    }
+    closeForm();
     await reload();
   };
 
@@ -79,30 +124,8 @@ export function ProjectsView({ onClose, readOnly }: Props) {
     await reload();
   };
 
-  const startEdit = (p: ProjectInfo) => {
-    setError(null);
-    setEditingKey(projectKey(p));
-    setEditBranch(p.default_base_branch ?? "");
-  };
-
-  const cancelEdit = () => {
-    setEditingKey(null);
-    setEditBranch("");
-  };
-
-  const handleSaveEdit = async (p: ProjectInfo) => {
-    setSavingEdit(true);
-    setError(null);
-    const trimmed = editBranch.trim();
-    const result = await updateProject(p.name, p.scope, trimmed || null);
-    setSavingEdit(false);
-    if (!result.ok) {
-      setError(result.error || "Update failed");
-      return;
-    }
-    cancelEdit();
-    await reload();
-  };
+  const lockedFieldClass =
+    "w-full px-3 py-2 text-sm bg-surface-900/60 border border-surface-700/30 rounded-md text-text-dim cursor-not-allowed mb-3";
 
   return (
     <div className="flex flex-col h-full bg-surface-900">
@@ -114,10 +137,10 @@ export function ProjectsView({ onClose, readOnly }: Props) {
           </p>
         </div>
         <div className="flex gap-2">
-          {!readOnly && !showAdd && (
+          {!readOnly && !formOpen && (
             <button
               type="button"
-              onClick={() => setShowAdd(true)}
+              onClick={openAdd}
               className="px-3 py-1.5 text-sm bg-brand-600 hover:bg-brand-700 text-surface-900 rounded-md cursor-pointer font-medium"
             >
               + Add project
@@ -139,46 +162,72 @@ export function ProjectsView({ onClose, readOnly }: Props) {
         </div>
       )}
 
-      {showAdd && !readOnly && (
-        <div className="px-4 pt-4">
-          <div className="bg-surface-800 border border-surface-700/40 rounded-lg p-4">
-            <h2 className="text-sm font-medium text-text-primary mb-3">Add project</h2>
+      {formOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={closeForm}
+        >
+          <div
+            className="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-surface-800 border border-surface-700/40 rounded-lg p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-medium text-text-primary mb-3">
+              {isEdit ? `Edit project '${editing?.name}'` : "Add project"}
+            </h2>
 
             <label className="block text-[12px] text-text-dim mb-1">Path</label>
-            <div className="flex gap-2 mb-3">
+            {isEdit ? (
               <input
                 type="text"
                 value={path}
-                onChange={(e) => setPath(e.target.value)}
-                placeholder="/path/to/repo"
-                className="flex-1 px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+                disabled
+                title="Path is fixed; remove and re-add the project to change it"
+                className={`${lockedFieldClass} font-mono`}
               />
-              <button
-                type="button"
-                onClick={() => setShowBrowser((b) => !b)}
-                className="px-3 py-2 text-sm border border-surface-700 text-text-secondary hover:bg-surface-700/40 rounded-md cursor-pointer"
-              >
-                {showBrowser ? "Hide browser" : "Browse"}
-              </button>
-            </div>
-            {showBrowser && (
-              <div className="mb-3">
-                <DirectoryBrowser
-                  onSelect={(p) => {
-                    setPath(p);
-                    setShowBrowser(false);
-                  }}
-                />
-              </div>
+            ) : (
+              <>
+                <div className="flex gap-2 mb-3">
+                  <input
+                    type="text"
+                    value={path}
+                    onChange={(e) => setPath(e.target.value)}
+                    placeholder="/path/to/repo"
+                    className="flex-1 px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowBrowser((b) => !b)}
+                    className="px-3 py-2 text-sm border border-surface-700 text-text-secondary hover:bg-surface-700/40 rounded-md cursor-pointer"
+                  >
+                    {showBrowser ? "Hide browser" : "Browse"}
+                  </button>
+                </div>
+                {showBrowser && (
+                  <div className="mb-3">
+                    <DirectoryBrowser
+                      onSelect={(p) => {
+                        setPath(p);
+                        setShowBrowser(false);
+                      }}
+                    />
+                  </div>
+                )}
+              </>
             )}
 
-            <label className="block text-[12px] text-text-dim mb-1">Name (optional)</label>
+            <label className="block text-[12px] text-text-dim mb-1">Name{isEdit ? "" : " (optional)"}</label>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="defaults to directory name"
-              className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 mb-3"
+              disabled={isEdit}
+              placeholder={isEdit ? undefined : "defaults to directory name"}
+              title={isEdit ? "Rename is not supported yet; remove and re-add to rename" : undefined}
+              className={
+                isEdit
+                  ? lockedFieldClass
+                  : "w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 mb-3"
+              }
             />
 
             <label className="block text-[12px] text-text-dim mb-1">Default base branch (optional)</label>
@@ -187,72 +236,80 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               value={baseBranch}
               onChange={(e) => setBaseBranch(e.target.value)}
               placeholder="blank = inherit global default, then auto-detect"
-              className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono mb-3"
+              className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono mb-1"
             />
+            <p className="text-[11px] text-text-dim mb-3">
+              Base branch new worktree branches for this project fork from. An
+              explicit per-session base wins; blank inherits the global default,
+              then the repo's detected default branch.
+            </p>
 
             <label className="block text-[12px] text-text-dim mb-1">Scope</label>
-            <div className="flex gap-2 mb-4">
-              {(["global", "profile"] as const).map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => setScope(s)}
-                  className={`px-3 py-1.5 text-sm rounded-md cursor-pointer transition-colors ${
-                    scope === s
-                      ? "bg-brand-600/20 border border-brand-600/40 text-text-primary"
-                      : "bg-surface-900 border border-surface-700/40 text-text-secondary hover:border-surface-700"
-                  }`}
-                >
-                  {s === "global" ? "Global (all profiles)" : "Profile-only"}
-                </button>
-              ))}
-            </div>
+            {isEdit ? (
+              <p className="mb-4 text-sm text-text-secondary capitalize">{scope}</p>
+            ) : (
+              <div className="flex gap-2 mb-4">
+                {(["global", "profile"] as const).map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setScope(s)}
+                    className={`px-3 py-1.5 text-sm rounded-md cursor-pointer transition-colors ${
+                      scope === s
+                        ? "bg-brand-600/20 border border-brand-600/40 text-text-primary"
+                        : "bg-surface-900 border border-surface-700/40 text-text-secondary hover:border-surface-700"
+                    }`}
+                  >
+                    {s === "global" ? "Global (all profiles)" : "Profile-only"}
+                  </button>
+                ))}
+              </div>
+            )}
 
-            <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={allowOverride}
-                onChange={(e) => setAllowOverride(e.target.checked)}
-                className="mt-0.5 cursor-pointer"
-              />
-              <span className="text-[12px] text-text-secondary">
-                Allow override
-                <span className="block text-text-dim text-[11px] mt-0.5">
-                  Permit registering even if this path already exists in the
-                  other scope. The profile entry will shadow the global one in
-                  merged views.
+            {!isEdit && (
+              <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={allowOverride}
+                  onChange={(e) => setAllowOverride(e.target.checked)}
+                  className="mt-0.5 cursor-pointer"
+                />
+                <span className="text-[12px] text-text-secondary">
+                  Allow override
+                  <span className="block text-text-dim text-[11px] mt-0.5">
+                    Permit registering even if this path already exists in the
+                    other scope. The profile entry will shadow the global one in
+                    merged views.
+                  </span>
                 </span>
-              </span>
-            </label>
+              </label>
+            )}
 
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setShowAdd(false);
-                  setShowBrowser(false);
-                  setPath("");
-                  setName("");
-                  setBaseBranch("");
-                  setScope("global");
-                  setAllowOverride(false);
-                  setError(null);
-                }}
+                onClick={closeForm}
                 className="px-3 py-1.5 text-sm border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                onClick={handleAdd}
-                disabled={!path.trim() || submitting}
+                onClick={isEdit ? handleSaveEdit : handleAdd}
+                disabled={(!isEdit && !path.trim()) || submitting}
                 className={`px-3 py-1.5 text-sm rounded-md font-medium ${
-                  !path.trim() || submitting
+                  (!isEdit && !path.trim()) || submitting
                     ? "bg-brand-600/40 text-surface-900/60 cursor-not-allowed"
                     : "bg-brand-600 hover:bg-brand-700 text-surface-900 cursor-pointer"
                 }`}
               >
-                {submitting ? "Adding…" : "Add"}
+                {isEdit
+                  ? submitting
+                    ? "Saving…"
+                    : "Save"
+                  : submitting
+                    ? "Adding…"
+                    : "Add"}
               </button>
             </div>
           </div>
@@ -301,50 +358,18 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                   <p className="text-[11px] font-mono text-text-dim truncate mt-0.5" title={p.path}>
                     {p.path}
                   </p>
-                  {editingKey === projectKey(p) ? (
-                    <div className="mt-1.5 flex items-center gap-2">
-                      <input
-                        type="text"
-                        autoFocus
-                        value={editBranch}
-                        onChange={(e) => setEditBranch(e.target.value)}
-                        placeholder="blank = inherit global default, then auto-detect"
-                        className="flex-1 px-2 py-1 text-[12px] bg-surface-900 border border-surface-700/40 rounded text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => handleSaveEdit(p)}
-                        disabled={savingEdit}
-                        className={`px-2 py-1 text-xs rounded-md font-medium ${
-                          savingEdit
-                            ? "bg-brand-600/40 text-surface-900/60 cursor-not-allowed"
-                            : "bg-brand-600 hover:bg-brand-700 text-surface-900 cursor-pointer"
-                        }`}
-                      >
-                        {savingEdit ? "Saving…" : "Save"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={cancelEdit}
-                        className="px-2 py-1 text-xs border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    p.default_base_branch && (
-                      <p className="text-[11px] text-text-dim mt-0.5">
-                        base branch:{" "}
-                        <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
-                      </p>
-                    )
+                  {p.default_base_branch && (
+                    <p className="text-[11px] text-text-dim mt-0.5">
+                      base branch:{" "}
+                      <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
+                    </p>
                   )}
                 </div>
-                {!readOnly && editingKey !== projectKey(p) && (
+                {!readOnly && (
                   <div className="flex gap-2">
                     <button
                       type="button"
-                      onClick={() => startEdit(p)}
+                      onClick={() => openEdit(p)}
                       className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-text-primary hover:border-surface-700 rounded-md cursor-pointer"
                     >
                       Edit

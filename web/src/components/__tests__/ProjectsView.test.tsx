@@ -107,7 +107,7 @@ describe("ProjectsView default base branch", () => {
     expect(screen.queryByText(/base branch:/i)).toBeNull();
   });
 
-  it("edits a project's base branch via the inline editor", async () => {
+  it("edits a project's base branch via the edit modal", async () => {
     mockFetch.mockResolvedValue([
       { name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" },
     ]);
@@ -125,7 +125,7 @@ describe("ProjectsView default base branch", () => {
     );
   });
 
-  it("clears the base branch by saving an empty inline editor", async () => {
+  it("clears the base branch by saving an empty value in the edit modal", async () => {
     mockFetch.mockResolvedValue([
       { name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" },
     ]);
