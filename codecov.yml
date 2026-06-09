@@ -17,9 +17,9 @@
 comment:
   layout: "header, diff, files, components, sunburst, uncovered, footer"
   behavior: default
-  require_changes: false
-  require_base: false
-  require_head: false
+  require_changes: true
+  require_base: true
+  require_head: true
   hide_project_coverage: false
 
 codecov:
@@ -32,6 +32,7 @@ codecov:
   # `wait_for_ci: true` additionally holds notifications until GitHub Actions
   # reports the workflow done, so a hung uploader cannot trigger a premature
   # evaluation either.
+  require_ci_to_pass: true
   notify:
     after_n_builds: 3
     wait_for_ci: true
