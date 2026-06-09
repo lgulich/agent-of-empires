@@ -187,6 +187,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
     if (tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable) {
       return true;
     }
+
     el = el.parentElement;
   }
   return false;
