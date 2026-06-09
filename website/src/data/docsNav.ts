@@ -93,6 +93,7 @@ export const docsNav: NavSection[] = [
       { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
       { title: "Sandbox Internals", href: "/docs/development/internals/sandbox/" },
       { title: "Session & Worktree Internals", href: "/docs/development/internals/sessions/" },
+      { title: "Plugin System Internals", href: "/docs/development/internals/plugin-system/" },
     ],
   },
 ];
