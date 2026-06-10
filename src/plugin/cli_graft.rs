@@ -27,11 +27,11 @@ pub fn grafted_commands(root: &Command) -> Vec<GraftedCommand> {
     for plugin in registry.active() {
         for contribution in &plugin.manifest.commands {
             let head = &contribution.path[0];
-            let collides_core = contribution.path.len() == 1
-                && root.get_subcommands().any(|c| c.get_name() == *head);
             let reserved = head == "plugin";
-            let collides_plugin = out.iter().any(|g| g.contribution.path == contribution.path);
-            if collides_core || reserved || collides_plugin {
+            if reserved
+                || core_owns_path(root, &contribution.path)
+                || conflicts_with_grafted(&out, &contribution.path)
+            {
                 warn!(
                     target: "plugin",
                     plugin = plugin.id(),
@@ -47,6 +47,35 @@ pub fn grafted_commands(root: &Command) -> Vec<GraftedCommand> {
         }
     }
     out
+}
+
+/// Core wins on the full path, not just the head: `["session", "ls"]` is
+/// owned when the core `session` group already has an `ls` verb; a top-level
+/// `["session"]` graft is owned because the group itself exists. A nested
+/// graft under an existing group whose leaf is free (`["session", "archive"]`)
+/// is allowed.
+fn core_owns_path(root: &Command, path: &[String]) -> bool {
+    let mut cursor = root;
+    for (depth, segment) in path.iter().enumerate() {
+        match cursor.get_subcommands().find(|c| c.get_name() == *segment) {
+            // The whole path resolves to a core-owned command.
+            Some(_) if depth == path.len() - 1 => return true,
+            Some(sub) => cursor = sub,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Earlier grafts win exact duplicates AND prefix overlaps in both
+/// directions: a grafted leaf `["review"]` blocks `["review", "x"]` (the leaf
+/// cannot also become a group), and a grafted `["review", "x"]` blocks a
+/// later `["review"]` leaf.
+fn conflicts_with_grafted(grafted: &[GraftedCommand], path: &[String]) -> bool {
+    grafted.iter().any(|g| {
+        let existing = &g.contribution.path;
+        existing.starts_with(path) || path.starts_with(existing)
+    })
 }
 
 fn build_clap_command(contribution: &CliCommandContribution) -> Command {
@@ -140,6 +169,42 @@ mod tests {
             plugin_id: "test-plugin".into(),
             contribution: contribution(path),
         }
+    }
+
+    fn paths(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter()
+            .map(|p| p.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn core_owns_full_paths_and_groups_but_not_free_leaves() {
+        let root =
+            Command::new("aoe").subcommand(Command::new("session").subcommand(Command::new("ls")));
+        let owned = paths(&[&["session"], &["session", "ls"]]);
+        for path in &owned {
+            assert!(core_owns_path(&root, path), "core must own {path:?}");
+        }
+        let free = paths(&[&["review"], &["session", "archive"]]);
+        for path in &free {
+            assert!(!core_owns_path(&root, path), "{path:?} must be graftable");
+        }
+    }
+
+    #[test]
+    fn grafted_prefix_overlaps_conflict_in_both_directions() {
+        let existing = vec![grafted(&["review"]), grafted(&["repo", "sync"])];
+        for path in paths(&[&["review"], &["review", "x"], &["repo"], &["repo", "sync"]]) {
+            assert!(
+                conflicts_with_grafted(&existing, &path),
+                "{path:?} must conflict"
+            );
+        }
+        assert!(!conflicts_with_grafted(&existing, &paths(&[&["repo2"]])[0]));
+        assert!(!conflicts_with_grafted(
+            &existing,
+            &paths(&[&["repo", "status"]])[0]
+        ));
     }
 
     #[test]
