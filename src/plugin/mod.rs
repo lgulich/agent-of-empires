@@ -9,10 +9,12 @@
 
 pub mod cli_graft;
 pub mod grants;
+pub mod host;
 pub mod install;
 pub mod lockfile;
 pub mod registry;
 pub mod runtime;
+pub mod sandbox;
 pub mod settings;
 
 use std::path::PathBuf;

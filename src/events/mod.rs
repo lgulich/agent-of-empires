@@ -55,6 +55,18 @@ pub fn topic_matches(pattern: &str, topic: &str) -> bool {
     }
 }
 
+/// The process-wide bus, opened lazily on the app dir's `events.db`.
+/// Plugin host APIs and core services publish through this instance.
+pub fn global() -> Result<&'static Arc<EventBus>> {
+    static GLOBAL: std::sync::OnceLock<Arc<EventBus>> = std::sync::OnceLock::new();
+    if let Some(bus) = GLOBAL.get() {
+        return Ok(bus);
+    }
+    let path = crate::session::get_app_dir()?.join("events.db");
+    let bus = Arc::new(EventBus::open(&path, DEFAULT_RETENTION_PER_TOPIC)?);
+    Ok(GLOBAL.get_or_init(|| bus))
+}
+
 /// Durable seq log + live broadcast + replay. One instance per daemon/TUI
 /// process, opened on the app dir's `events.db`.
 pub struct EventBus {
