@@ -7,6 +7,7 @@ pub mod build_info;
 pub mod claude_settings;
 pub mod cli;
 pub mod containers;
+pub mod events;
 pub mod file_watch;
 pub mod git;
 pub mod github;
