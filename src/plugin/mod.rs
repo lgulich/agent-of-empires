@@ -96,10 +96,14 @@ pub fn registry() -> Arc<PluginRegistry> {
 }
 
 /// Rebuild the registry from the current on-disk config and install state.
+/// Tears down every running worker (and resets respawn budgets) so a
+/// disabled, uninstalled, or capability-changed plugin cannot keep its old
+/// worker and grant set alive; active plugins respawn on their next call.
 pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
     *REGISTRY.write().expect("plugin registry lock") = Some(reg.clone());
     status::invalidate_cache();
+    host::host().reset();
     reg
 }

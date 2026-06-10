@@ -110,6 +110,16 @@ impl PluginHost {
         }
     }
 
+    /// Kill every worker AND reset the respawn budgets. Called on registry
+    /// reload (enable/disable/install/uninstall/update): a disabled or
+    /// updated plugin must not keep its old worker, subscriptions, or grant
+    /// set alive, and an intentional disable/enable cycle starts with a
+    /// fresh budget. Still-active plugins respawn on their next call.
+    pub fn reset(&self) {
+        self.shutdown();
+        self.spawn_counts.lock().expect("spawn counts lock").clear();
+    }
+
     fn mark_dead(&self, worker: &Arc<Worker>) {
         worker.alive.store(false, Ordering::SeqCst);
         if let Ok(mut child) = worker.child.lock() {
