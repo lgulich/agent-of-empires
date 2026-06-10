@@ -45,6 +45,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin enable`↴](#aoe-plugin-enable)
 * [`aoe plugin disable`↴](#aoe-plugin-disable)
 * [`aoe plugin update`↴](#aoe-plugin-update)
+* [`aoe settings`↴](#aoe-settings)
+* [`aoe settings explain`↴](#aoe-settings-explain)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -120,6 +122,7 @@ Run without arguments to launch the TUI dashboard.
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `plugin` — Manage plugins (install, enable, disable, update)
+* `settings` — Inspect settings (resolution provenance, defaults)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
@@ -750,6 +753,30 @@ Update an installed plugin from its recorded source
 ###### **Options:**
 
 * `--yes` — Skip the capability re-prompt when the declared set changed
+
+
+
+## `aoe settings`
+
+Inspect settings (resolution provenance, defaults)
+
+**Usage:** `aoe settings <COMMAND>`
+
+###### **Subcommands:**
+
+* `explain` — Explain where a setting's effective value comes from
+
+
+
+## `aoe settings explain`
+
+Explain where a setting's effective value comes from
+
+**Usage:** `aoe settings explain [KEY]`
+
+###### **Arguments:**
+
+* `<KEY>` — Fully qualified plugin setting key, `<plugin-id>.<key>`. Omit to list every plugin setting with its winning source
 
 
 

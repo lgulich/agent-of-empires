@@ -70,6 +70,7 @@ export const docsNav: NavSection[] = [
       { title: "Telemetry", href: "/docs/telemetry/" },
       { title: "GitHub Integration", href: "/docs/github-integration/" },
       { title: "Configuration", href: "/docs/guides/configuration/" },
+      { title: "Plugins", href: "/docs/plugins/" },
     ],
   },
   {

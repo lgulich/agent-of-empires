@@ -666,6 +666,7 @@ impl HomeView {
             sort_picker_dialog,
             project_session_picker_dialog,
             projects_dialog,
+            plugin_manager_dialog,
             command_palette,
             tool_picker_dialog,
             send_message_dialog,

@@ -1,0 +1,72 @@
+# Plugins
+
+Agent of Empires keeps its core small (sessions, tmux, worktrees) and ships
+everything else as plugins you can enable, disable, install, update, and
+remove at runtime. First-party plugins are bundled with the binary and
+enabled by default; community plugins install from a GitHub slug or a local
+directory at your own risk, behind an explicit capability approval.
+
+## Managing plugins
+
+Three equivalent surfaces:
+
+- **CLI**: `aoe plugin list`, `aoe plugin info <id>`, `aoe plugin install
+  <owner/repo | path>`, `aoe plugin enable|disable <id>`, `aoe plugin update
+  <id>`, `aoe plugin uninstall <id>`.
+- **TUI**: open the command palette and run "Manage plugins". Space toggles
+  enable/disable, `i` installs, `u` updates, `x` uninstalls.
+- **Web dashboard**: Settings, then the Plugins tab. The same list, toggles,
+  install form, and capability approval dialog. Plugin mutations require an
+  elevated (passphrase) session when login is enabled and are blocked in
+  read-only mode.
+
+Disabling a plugin removes its commands, keybinds, settings rows, and themes
+from every surface on the next render; its settings stay on disk and come
+back when re-enabled.
+
+## Bundled plugins
+
+| Plugin | What it does | Disabled behavior |
+|---|---|---|
+| `aoe.status` | Agent status detection: declarative rules plus a worker for complex parsers (codex). Also gives custom `--cmd` agents basic running/waiting detection. | Falls back to the builtin in-core detectors; custom agents show idle. |
+| `aoe.attention` | Attention-sort metadata (extraction in progress). | Attention sort keeps working from core. |
+| `aoe.web` | The web dashboard management marker (serve builds only). | `aoe serve` refuses to start until re-enabled. |
+
+## Installing community plugins
+
+```sh
+aoe plugin install owner/repo      # shallow git clone from GitHub
+aoe plugin install ./my-plugin     # local directory with aoe-plugin.toml
+```
+
+Before anything is written, aoe shows the plugin's declared capabilities
+(for example `pane-read`, `net-fetch`, `sessions-meta-write`) and asks once.
+The approval is pinned to the exact manifest: if an update changes the
+declared capability set, the plugin's runtime contributions deactivate until
+you approve again.
+
+Be honest with yourself about what that approval means: capability gating
+controls what a plugin can ask aoe to do through its API. It is not an OS
+sandbox; a plugin's worker process runs with your user's permissions.
+OS-level isolation backends are planned and will tighten this over time.
+
+## Plugin settings
+
+A plugin's settings render in the normal settings surfaces (TUI Settings
+under Plugins, web Settings Plugins tab) with no extra UI code, and are
+stored under `[plugins."<id>".settings]` in `config.toml`. Plugins may also
+override another plugin's setting defaults by declared priority; your own
+config value always wins. Inspect any resolution with:
+
+```sh
+aoe settings explain <plugin-id>.<key>
+```
+
+## Writing a plugin
+
+A plugin is a directory with an `aoe-plugin.toml` manifest declaring its
+contributions (settings, CLI commands, TUI keybinds, themes, status
+detection rules) and, when it needs to run code, a `[runtime]` entrypoint:
+an executable speaking newline-delimited JSON-RPC on stdio, in any language.
+The manifest schema and capability list live in the `aoe-plugin-api` crate;
+the full design is in `docs/development/internals/plugin-system.md`.

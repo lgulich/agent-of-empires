@@ -148,6 +148,13 @@ const PAGES = [
 
   // --- Docs pages (docs/ → pages/docs/) ---
   {
+    source: "docs/plugins.md",
+    dest: "docs/plugins.md",
+    title: "Plugins",
+    description:
+      "Enable, disable, install, and update plugins from the CLI, TUI, or web dashboard; capability approvals, bundled plugins, and writing your own.",
+  },
+  {
     source: "docs/index.md",
     dest: "docs/index.md",
     title: "Agent of Empires",
@@ -354,6 +361,7 @@ const PAGES = [
 // Every known docs path → website URL, used for link rewriting.
 const URL_MAP = {
   // Docs pages
+  "docs/plugins.md": "/docs/plugins/",
   "docs/index.md": "/docs/",
   "docs/installation.md": "/docs/installation/",
   "docs/quick-start.md": "/docs/quick-start/",

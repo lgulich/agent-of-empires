@@ -146,6 +146,33 @@ fn run_info(id: &str) -> Result<()> {
     if m.runtime.is_some() {
         println!("  runtime: JSON-RPC worker (Tier 1)");
     }
+    // Resolved keybinds with shadowing: a chord a core action owns never
+    // fires for a plugin, and that must be inspectable rather than silent.
+    let bindings = crate::tui::home::bindings::plugin_bindings();
+    let mine: Vec<_> = bindings.iter().filter(|b| b.plugin_id == id).collect();
+    if !mine.is_empty() {
+        println!("  keybinds:");
+        for binding in mine {
+            let mut shadow_notes = Vec::new();
+            for (strict, label) in [(false, "non-strict"), (true, "strict")] {
+                if let Some(owner) =
+                    crate::tui::home::bindings::shadowing_core_action(&binding.chord, strict)
+                {
+                    shadow_notes.push(format!("shadowed by core {owner:?} in {label} mode"));
+                }
+            }
+            let note = if shadow_notes.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", shadow_notes.join("; "))
+            };
+            println!(
+                "    - {} (priority {}){note}",
+                binding.canonical_id(),
+                binding.priority,
+            );
+        }
+    }
     Ok(())
 }
 

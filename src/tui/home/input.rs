@@ -1900,6 +1900,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.plugin_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2320,6 +2330,9 @@ impl HomeView {
             ActionId::Projects => {
                 let profile = self.config_profile();
                 self.projects_dialog = Some(ProjectsDialog::new(&profile));
+            }
+            ActionId::Plugins => {
+                self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
             }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
