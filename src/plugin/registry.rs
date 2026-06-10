@@ -38,6 +38,12 @@ pub static BUILTINS: &[BuiltinPlugin] = &[
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-attention/aoe-plugin.toml"),
     },
+    // The web dashboard's management marker only exists when the dashboard
+    // is compiled in at all.
+    #[cfg(all(feature = "serve", not(feature = "no-default-plugins")))]
+    BuiltinPlugin {
+        manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
+    },
 ];
 
 /// One discovered plugin with its resolved enablement and grant state.
