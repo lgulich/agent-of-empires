@@ -462,8 +462,10 @@ impl Session {
 
     pub fn detect_status(&self, tool: &str) -> Result<Status> {
         let content = self.capture_pane(50)?;
-        Ok(super::status_detection::detect_status_from_content(
-            &content, tool,
+        Ok(super::status_detection::detect_status_for_session(
+            Some(&self.name),
+            &content,
+            tool,
         ))
     }
 

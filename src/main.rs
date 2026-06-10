@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Init(args)) => return cli::init::run(args).await,
         Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
+        Some(Commands::PluginWorker(args)) => return cli::plugin_worker::run(args),
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
             return match command {

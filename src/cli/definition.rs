@@ -200,6 +200,11 @@ pub enum Commands {
     #[command(name = "__extract-session-id", hide = true)]
     ExtractSessionId(ExtractSessionIdArgs),
 
+    /// Internal: Tier 1 worker for builtin plugins, spawned by the plugin
+    /// host with piped stdio speaking ndjson JSON-RPC. Hidden from help.
+    #[command(name = "__plugin-worker", hide = true)]
+    PluginWorker(super::plugin_worker::PluginWorkerArgs),
+
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),
 
@@ -297,6 +302,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
+        Commands::PluginWorker(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Completion { .. } => "completion",

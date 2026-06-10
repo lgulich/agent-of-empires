@@ -16,6 +16,7 @@ pub mod registry;
 pub mod runtime;
 pub mod sandbox;
 pub mod settings;
+pub mod status;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -99,5 +100,6 @@ pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
     *REGISTRY.write().expect("plugin registry lock") = Some(reg.clone());
+    status::invalidate_cache();
     reg
 }

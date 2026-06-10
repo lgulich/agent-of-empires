@@ -1,7 +1,67 @@
-# First-party status-detection plugin. Bundled with the aoe binary; lives in
-# plugins/ so it can move to its own repository without host changes.
+# First-party status-detection plugin (D7, the reference plugin of #268).
+# Bundled with the aoe binary; lives in plugins/ so it can move to its own
+# repository without host changes.
+#
+# Two tiers:
+# - Declarative rules (Tier 0, evaluated in-core, no code runs): the wildcard
+#   agent "*" gives custom `--cmd` agents basic detection; builtin agents
+#   keep their first-party detectors unless explicitly claimed here.
+# - Batched RPC (Tier 1): codex turn-block parsing runs in the plugin worker
+#   (`aoe __plugin-worker --id aoe.status`), one detect_batch per poll window
+#   with per-snapshot error isolation.
+#
+# Disabling this plugin falls back to the builtin in-core detectors.
+
 id = "aoe.status"
 name = "Agent Status Detection"
-version = "1.0.0"
+version = "1.1.0"
 api_version = 1
 description = "Detects agent session status (running/waiting/idle) from tmux pane text: declarative rules for keyword-matching agents, a batched RPC worker for complex parsers."
+capabilities = ["pane-read"]
+
+[[settings]]
+key = "custom_agent_rules"
+label = "Detect custom agent status"
+description = "Apply the generic running/waiting rules to custom (--cmd) agents instead of always showing them as idle."
+default = true
+
+[settings.widget]
+kind = "toggle"
+
+# Generic detection for tools with no builtin agent entry. Previously these
+# were hardcoded Idle.
+[[status_detection]]
+agent = "*"
+mode = "declarative"
+
+[[status_detection.rules]]
+status = "running"
+priority = 100
+contains = ["esc to interrupt"]
+
+[[status_detection.rules]]
+status = "running"
+priority = 95
+contains = ["ctrl+c to interrupt"]
+
+[[status_detection.rules]]
+status = "waiting"
+priority = 90
+regex = "\\(y/n\\)|\\[y/n\\]|approve|allow"
+
+[[status_detection.rules]]
+status = "idle"
+priority = 0
+default = true
+
+# Codex turn-block parsing is too stateful for declarative rules; it runs in
+# the worker, batched per poll window.
+[[status_detection]]
+agent = "codex"
+mode = "rpc"
+method = "status.detect_batch"
+
+[runtime]
+# Ignored for builtin plugins: the host runs the current aoe binary's hidden
+# __plugin-worker subcommand instead.
+entrypoint = "aoe"

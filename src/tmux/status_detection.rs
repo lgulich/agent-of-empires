@@ -81,10 +81,21 @@ fn matches_input_prompt(non_empty_lines: &[&str], take_n: usize, tool_prompts: &
 }
 
 pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
+    detect_status_for_session(None, content, tool)
+}
+
+/// Like [`detect_status_from_content`], with a session identity so plugin
+/// Tier 1 (batched RPC) detection can cache per-session results.
+pub fn detect_status_for_session(session: Option<&str>, content: &str, tool: &str) -> Status {
     // Strip ANSI escape codes before passing to detectors. capture-pane is
     // called with -e (to preserve colors for the TUI preview), but color codes
     // interspersed in text like "esc interrupt" break plain substring matches.
     let clean = strip_ansi(content);
+    // An active plugin claiming this agent owns its detection (D7); disabling
+    // the plugin falls through to the builtin detector below.
+    if let Some(status) = crate::plugin::status::detect(session, tool, &clean) {
+        return status;
+    }
     crate::agents::get_agent(tool)
         .map(|a| (a.detect_status)(&clean))
         .unwrap_or(Status::Idle)
