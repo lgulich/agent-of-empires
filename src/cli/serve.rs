@@ -560,24 +560,24 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         return stop_daemon().await;
     }
 
-    // The dashboard is managed as the aoe.web default plugin: disabling it
-    // turns off the serve surface at runtime without recompiling (#268).
-    // Stop/status/restart above stay available so a running daemon can
-    // always be brought down.
-    if let Some(plugin) = crate::plugin::registry().get("aoe.web") {
-        if !plugin.enabled {
-            anyhow::bail!(
-                "the web dashboard plugin is disabled; run `aoe plugin enable aoe.web` first"
-            );
-        }
-    }
-
     if args.status {
         return print_status().await;
     }
 
     if args.restart {
         return restart_daemon().await;
+    }
+
+    // The dashboard is managed as the aoe.web default plugin: disabling it
+    // turns off the serve surface at runtime without recompiling (#268).
+    // Stop/status/restart above stay available so a running daemon can
+    // always be inspected and brought down.
+    if let Some(plugin) = crate::plugin::registry().get("aoe.web") {
+        if !plugin.enabled {
+            anyhow::bail!(
+                "the web dashboard plugin is disabled; run `aoe plugin enable aoe.web` first"
+            );
+        }
     }
 
     // Refuse to start a second instance (daemon or foreground) while another
