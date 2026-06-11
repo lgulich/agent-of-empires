@@ -57,6 +57,13 @@ pub fn index() -> &'static FeaturedIndex {
 }
 
 impl FeaturedIndex {
+    /// Whether a plugin id is part of the curated index. Telemetry uses this
+    /// as its identity allowlist: only featured ids are publicly known, so
+    /// only they may be named on the wire (`telemetry::plugins`).
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.featured.iter().any(|p| p.id == id)
+    }
+
     /// Validate a staged plugin fetched from `slug` against the index.
     /// Errors are security refusals: a featured slug serving a different
     /// plugin id, or a pinned release whose tree hash does not match.

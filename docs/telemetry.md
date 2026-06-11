@@ -32,6 +32,12 @@ kinds:
     allow/deny mix, agent switches, plan-mode use, queued prompts),
   - for `aoe serve` only, coarse deployment enums: auth mode (`token` /
     `passphrase` / `none`) and exposure (`tunnel` / `tailscale` / `local`),
+  - plugin adoption: a per-source install count (`builtin` / `github` /
+    `path`) and, for plugins whose identity is already public, whether they
+    are active. Only builtin plugin ids and ids from the curated featured
+    index are ever named; an unfeatured GitHub install (which may be a
+    private repository) or a local-directory plugin is only counted, never
+    identified. No repository slug or filesystem path leaves your machine,
   - the version-health signals below.
 
 Model names are mapped to a coarse family vocabulary (`claude`, `openai`,

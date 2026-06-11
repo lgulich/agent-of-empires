@@ -31,7 +31,9 @@ use serde::Serialize;
 /// v11 (#1888): added the structured-interaction aggregates (`approvals_resolved`,
 /// `approvals_by_decision`, `agent_switches`, `view_toggles`,
 /// `plan_mode_seen`, `prompts_queued`).
-pub const SCHEMA_VERSION: u32 = 11;
+/// v12 (#268): added the plugin adoption maps (`plugins_by_source`,
+/// `plugins_active`).
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -209,6 +211,16 @@ pub struct UsageSnapshot {
     /// features be tracked by registering the flag, not by extending the
     /// schema. See `telemetry::features`.
     pub features: BTreeMap<String, bool>,
+
+    /// Installed plugin census: closed source key (`builtin` / `github` /
+    /// `path`) -> count. All three keys always present (pre-seeded to 0).
+    /// Never carries a slug, path, or id; see `telemetry::plugins`.
+    pub plugins_by_source: BTreeMap<String, u32>,
+    /// Allowlisted plugin id -> active (enabled and capability grant
+    /// current). Identity is restricted to the closed public set: builtin
+    /// plugin ids plus ids from the curated featured index. Unfeatured or
+    /// local plugins only ever appear in [`Self::plugins_by_source`].
+    pub plugins_active: BTreeMap<String, bool>,
 
     /// Window-scoped usage activity: allowlisted signal name -> times the
     /// surface was opened since the last snapshot. Keyed by the fixed registry

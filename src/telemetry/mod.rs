@@ -22,6 +22,7 @@ pub mod aggregate;
 pub mod events;
 pub mod features;
 pub mod form_factor;
+pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
@@ -415,6 +416,11 @@ pub fn build_usage_snapshot(
     snapshot.data_schema_version = crate::migrations::current_schema_version();
     snapshot.update_status = update_status;
     snapshot.update_releases_behind = update_releases_behind;
+    // Plugin adoption reads the in-memory plugin registry; filled here with
+    // the other install-level state so the pure assembler stays I/O-free.
+    let adoption = plugins::plugin_adoption();
+    snapshot.plugins_by_source = adoption.by_source;
+    snapshot.plugins_active = adoption.active;
     Some(snapshot)
 }
 
@@ -472,6 +478,11 @@ fn assemble_usage_snapshot(
         distinct_sessions_by_agent: BTreeMap::new(),
         distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
+        // Plugin adoption reads the global plugin registry, which the
+        // disk-free assembler must not touch; `build_usage_snapshot` fills
+        // the real maps alongside the other install-level I/O.
+        plugins_by_source: BTreeMap::new(),
+        plugins_active: BTreeMap::new(),
         usage_seen,
         // Serve-only per-form-factor maps; the disk-free assembler leaves them
         // empty and `build_serve_snapshot` fills them from the daemon's client
@@ -782,6 +793,8 @@ mod tests {
             distinct_sessions_by_agent: BTreeMap::new(),
             distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
+            plugins_by_source: BTreeMap::new(),
+            plugins_active: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
             structured_clients_seen: BTreeMap::new(),

@@ -179,6 +179,55 @@ fn snapshot_buckets_are_sanitized() {
     }
 }
 
+/// Plugin adoption (#268): the snapshot names plugins only from the closed
+/// public set (builtin ids + curated featured index); everything else is a
+/// coarse per-source count. The allowlist filtering itself is unit-tested in
+/// `telemetry::plugins`; this covers the wire shape end to end.
+#[test]
+#[serial]
+fn plugin_adoption_names_only_the_closed_public_set() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+        &telemetry::StructuredInteractionCounts::default(),
+    )
+    .expect("snapshot built when opted in");
+
+    // The source census always carries the full closed key set.
+    for key in ["builtin", "github", "path"] {
+        assert!(
+            snapshot.plugins_by_source.contains_key(key),
+            "plugins_by_source missing closed key `{key}`"
+        );
+    }
+    // An isolated install has no community plugins.
+    assert_eq!(snapshot.plugins_by_source.get("github"), Some(&0));
+    assert_eq!(snapshot.plugins_by_source.get("path"), Some(&0));
+
+    // Every named plugin must come from the compiled-in builtin set; this
+    // install has nothing featured installed. Builtins all use the aoe.
+    // namespace, so a leaked slug or path would fail this closed-set check.
+    for id in snapshot.plugins_active.keys() {
+        assert!(
+            id.starts_with("aoe."),
+            "unexpected non-builtin plugin id on the wire: {id}"
+        );
+    }
+    assert_eq!(
+        snapshot.plugins_active.len() as u32,
+        *snapshot.plugins_by_source.get("builtin").expect("seeded"),
+        "every builtin is named, nothing else is"
+    );
+}
+
 /// User story (#1883): the snapshot's per-class client form-factor maps are a
 /// presence set on the wire. Only seen classes appear (as `true`); a never-seen
 /// class is absent (not `false`); and an empty map is omitted entirely rather
