@@ -245,7 +245,14 @@ pub fn revision() -> u64 {
 
 fn with_store<T>(f: impl FnOnce(&mut UiStore) -> T) -> T {
     let mut guard = STORE.write().expect("ui store lock");
-    f(guard.get_or_insert_with(UiStore::default))
+    let store = guard.get_or_insert_with(UiStore::default);
+    // Sweep expired entries on every write so TTL actually caps memory and
+    // read-side scans in a long-lived daemon; reads only filter.
+    let now = Instant::now();
+    store
+        .state
+        .retain(|_, value| value.expires_at.map(|at| at > now).unwrap_or(true));
+    f(store)
 }
 
 fn read_store<T>(f: impl FnOnce(&UiStore) -> T) -> T {
