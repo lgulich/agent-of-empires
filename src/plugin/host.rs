@@ -373,6 +373,10 @@ fn authorize(plugin_id: &str, granted: &[Capability], method: &str) -> Result<()
         "events.subscribe" => Capability::EventsSubscribe,
         "sessions.list" | "session.meta.get" => Capability::SessionsRead,
         "session.meta.set" | "session.meta.cas" => Capability::SessionsMetaWrite,
+        // UI pushes are authorized by the manifest's declared contributions
+        // (checked per call in the ui store), not by a capability: the
+        // content is host-validated display state, never code.
+        "ui.state.set" | "ui.state.remove" | "ui.notify" => return Ok(()),
         other => bail!("unknown host method {other:?}"),
     };
     if granted.contains(&needed) {
@@ -449,6 +453,58 @@ fn handle_host_call(worker: &Arc<Worker>, method: &str, params: Value) -> Result
                 .ok_or_else(|| anyhow!("session.meta.cas needs a value"))?;
             set_meta(&worker.plugin_id, &session_id, Some(expected), value)
                 .map(|outcome| json!(outcome))
+        }
+        "ui.state.set" => {
+            let contribution_id = required_str(&params, "contribution_id")?.to_string();
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let ttl_ms = params.get("ttl_ms").and_then(Value::as_u64);
+            let payload: super::ui::UiPayload = serde_json::from_value(
+                params
+                    .get("payload")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("ui.state.set needs a payload"))?,
+            )
+            .map_err(|e| anyhow!("invalid ui payload: {e}"))?;
+            super::ui::set_state(
+                &worker.plugin_id,
+                &contribution_id,
+                session_id,
+                ttl_ms,
+                payload,
+            )?;
+            Ok(json!({ "ok": true }))
+        }
+        "ui.state.remove" => {
+            let contribution_id = required_str(&params, "contribution_id")?.to_string();
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            super::ui::remove_state(&worker.plugin_id, &contribution_id, session_id)?;
+            Ok(json!({ "ok": true }))
+        }
+        "ui.notify" => {
+            let title = required_str(&params, "title")?.to_string();
+            let body = params
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let severity: super::ui::Severity = params
+                .get("severity")
+                .map(|s| serde_json::from_value(s.clone()))
+                .transpose()
+                .map_err(|e| anyhow!("invalid severity: {e}"))?
+                .unwrap_or_default();
+            let session_id = params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            super::ui::notify(&worker.plugin_id, title, body, severity, session_id)?;
+            Ok(json!({ "ok": true }))
         }
         _ => unreachable!("authorize() rejects unknown methods"),
     }

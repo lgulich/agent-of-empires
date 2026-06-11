@@ -262,6 +262,28 @@ Sized to what the first three plugins (status detection, attention sort, triage)
 
 Tier 0 contributions (settings, keybinds, themes, declarative rules) are implicit and need no runtime capability. A future "security plugin" that gates other plugins' capability use is out of scope for v1; the manifest reserves a `gates` field name for it.
 
+## D9. UI extension points: declared slots, pushed state, host rendering
+
+Decided by a three-model debate (unanimous on the architecture): no runtime
+plugin JS in the dashboard (same-origin plugin code in an authenticated UI
+that can approve installs is privilege escalation), no render-time RPC (the
+ratatui draw loop never awaits a worker), host renders everything.
+
+A manifest declares `[[ui]]` contributions (id, slot, title, priority)
+against the fixed slots in `aoe_plugin_api::UiSlot`. The worker pushes
+typed payloads (`ui.state.set` / `ui.state.remove` / `ui.notify`) which the
+host validates against the slot schema, ownership (the contribution must be
+declared in the user-approved manifest), and size caps, then caches in the
+in-memory `plugin::ui` store with optional TTL. Both surfaces render from
+the cache: the TUI reads synchronously per frame (a revision counter wakes
+the draw loop), the web polls `GET /api/ui/state` on the same counter.
+Canonical plugin data stays in `plugin_meta`; UI state is derived and
+rebuilt by the worker after a restart. `reload_registry` evicts the state
+of any plugin no longer active, so disable/uninstall removes contributed UI
+immediately. The `session-list-sort-key` slot is exposed as a selectable
+sort mode and composes on top of the core order; it never replaces the
+user's ordering silently.
+
 ## The ACP seam (open question 2 of #268)
 
 Core keeps the generic substrate: process supervision (`src/process/` after the lift), the event store and bus, the single-writer state actor pattern, and the fs/terminal delegation handler interfaces. The ACP plugin layer owns protocol semantics: the ACP client method shapes, approvals and permission building, the agent registry and compatibility checks, agent profiles, and context priming. Core's `Instance` already needs only `acp_session_id` from all of ACP, which confirms the split is real rather than aspirational. The extraction itself is late-phase (after the contribution model is proven); nothing in earlier phases blocks on it.

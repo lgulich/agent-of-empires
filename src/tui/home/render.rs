@@ -444,6 +444,20 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 /// space. The padding is what the row should push between the prefix and
 /// the column to right-align it. `None` means the row is too wide and the
 /// column should be skipped entirely (the title takes priority).
+/// Theme color for a plugin-contributed severity tint, shared by every
+/// plugin UI slot the home view renders.
+pub(crate) fn plugin_severity_color(
+    severity: crate::plugin::ui::Severity,
+    theme: &Theme,
+) -> ratatui::style::Color {
+    match severity {
+        crate::plugin::ui::Severity::Info => theme.dimmed,
+        crate::plugin::ui::Severity::Success => theme.running,
+        crate::plugin::ui::Severity::Warning => theme.waiting,
+        crate::plugin::ui::Severity::Error => theme.error,
+    }
+}
+
 fn activity_column_padding(
     prefix_width: usize,
     list_width: u16,
@@ -667,6 +681,7 @@ impl HomeView {
             project_session_picker_dialog,
             projects_dialog,
             plugin_manager_dialog,
+            plugin_panels_dialog,
             command_palette,
             tool_picker_dialog,
             send_message_dialog,
@@ -904,6 +919,7 @@ impl HomeView {
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.plugin_panels_dialog.is_some()
             || self.command_palette.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
@@ -1232,6 +1248,47 @@ impl HomeView {
                             tag_style
                         },
                     ));
+                }
+
+                // Plugin row badges and column cells, read from the cached
+                // UI state store (never a worker call). Badges render as
+                // [text]; columns as title:value with the manifest title as
+                // the inline header (the list has no header row). Counted
+                // into `used_width` so the activity column still aligns.
+                for entry in crate::plugin::ui::entries(
+                    aoe_plugin_api::UiSlot::SessionListRowBadge,
+                    Some(id),
+                ) {
+                    if let crate::plugin::ui::UiPayload::Badge { text, severity, .. } =
+                        &entry.payload
+                    {
+                        let style = Style::default().fg(plugin_severity_color(*severity, theme));
+                        line_spans.push(Span::styled(
+                            format!("  [{text}]"),
+                            if is_selected {
+                                selected_row_style(style, theme)
+                            } else {
+                                style
+                            },
+                        ));
+                    }
+                }
+                for entry in
+                    crate::plugin::ui::entries(aoe_plugin_api::UiSlot::SessionListColumn, Some(id))
+                {
+                    if let crate::plugin::ui::UiPayload::Cell { text, severity, .. } =
+                        &entry.payload
+                    {
+                        let style = Style::default().fg(plugin_severity_color(*severity, theme));
+                        line_spans.push(Span::styled(
+                            format!("  {}:{text}", entry.title),
+                            if is_selected {
+                                selected_row_style(style, theme)
+                            } else {
+                                style
+                            },
+                        ));
+                    }
                 }
 
                 // Right edge of the row: optional terminal-mode badge, and
@@ -2738,6 +2795,35 @@ impl HomeView {
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
             groups.push((0, mk("↵ ", enter_action_text)));
+        }
+
+        // Plugin status-bar segments (pushed UI state, read from cache,
+        // never a worker call). Priority 2: they survive moderate widths
+        // but drop before core navigation hints.
+        for entry in crate::plugin::ui::entries(aoe_plugin_api::UiSlot::StatusBarSegment, None) {
+            if let crate::plugin::ui::UiPayload::Badge { text, severity, .. } = &entry.payload {
+                groups.push((
+                    2,
+                    vec![Span::styled(
+                        text.clone(),
+                        Style::default().fg(plugin_severity_color(*severity, theme)),
+                    )],
+                ));
+            }
+        }
+        // Newest plugin notification as a compact chip; the full ring lives
+        // in the Plugin panels dialog.
+        if let Some(latest) = crate::plugin::ui::notifications().into_iter().next() {
+            let text = format!("\u{2691} {}", latest.title);
+            groups.push((
+                1,
+                vec![Span::styled(
+                    text,
+                    Style::default()
+                        .fg(plugin_severity_color(latest.severity, theme))
+                        .bold(),
+                )],
+            ));
         }
 
         groups.push((2, mk(if strict { "T" } else { "t" }, "View")));

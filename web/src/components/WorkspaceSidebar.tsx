@@ -74,6 +74,7 @@ import {
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
+import { PluginSessionRowItems } from "./PluginUi";
 import { EMPTY_SELECTION, classifyClick, selectionReducer } from "../lib/sidebarSelection";
 import { bucketSelectionForBulk, summarizeBulkResults } from "../lib/sidebarBulk";
 import { reportError, reportInfo } from "../lib/toastBus";
@@ -931,6 +932,7 @@ export const SessionRow = memo(function SessionRow({
               <span className="truncate" title={label}>
                 {label}
               </span>
+              {sessionId && <PluginSessionRowItems sessionId={sessionId} />}
               {hasDraft && (
                 <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
                   <Pencil className="h-3 w-3 text-amber-400/90" />

@@ -4,7 +4,7 @@ pub(crate) mod bindings;
 mod input;
 mod live_send;
 mod operations;
-mod render;
+pub(crate) mod render;
 
 #[cfg(test)]
 mod tests;
@@ -428,6 +428,9 @@ pub struct HomeView {
     pub(super) selected_group_profile: Option<String>,
     pub(super) view_mode: ViewMode,
     pub(super) sort_order: SortOrder,
+    /// Plugin-contributed sort mode layered on `sort_order`:
+    /// `(plugin_id, contribution_id)` of a `session-list-sort-key` slot.
+    pub(super) plugin_sort: Option<(String, String)>,
     pub(super) group_by: GroupByMode,
     /// Per-row tag config; what to show next to each session title.
     /// Cached from resolved SessionConfig at construction + reload_settings;
@@ -494,6 +497,7 @@ pub struct HomeView {
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
+    pub(super) plugin_panels_dialog: Option<crate::tui::dialogs::PluginPanelsDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -1239,6 +1243,13 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
             .unwrap_or_default();
+        let plugin_sort = user_config
+            .as_ref()
+            .and_then(|c| c.app_state.plugin_sort.as_ref())
+            .and_then(|raw| {
+                raw.split_once('/')
+                    .map(|(p, c)| (p.to_string(), c.to_string()))
+            });
         // New users (haven't dismissed the welcome screen) default to Project
         // grouping so they see the same layout as the web dashboard. Existing
         // users keep Manual (the existing behavior) unless they explicitly
@@ -1277,6 +1288,7 @@ impl HomeView {
             selected_group_profile: None,
             view_mode,
             sort_order,
+            plugin_sort,
             group_by,
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
@@ -1312,6 +1324,7 @@ impl HomeView {
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
+            plugin_panels_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
@@ -3539,6 +3552,7 @@ impl HomeView {
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.plugin_panels_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -3578,6 +3592,7 @@ impl HomeView {
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.plugin_panels_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -3760,6 +3775,49 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
+        let mut items = self.build_flat_items_core();
+        self.apply_plugin_sort(&mut items);
+        items
+    }
+
+    /// Re-rank sessions inside each contiguous run (group boundaries break
+    /// runs) by the active plugin sort key, highest first. Sessions the
+    /// plugin pushed no key for keep their relative core order at the
+    /// bottom of their run; group rows never move. Reads only the cached
+    /// plugin UI state, never a worker.
+    fn apply_plugin_sort(&self, items: &mut [Item]) {
+        let Some((plugin_id, contribution_id)) = &self.plugin_sort else {
+            return;
+        };
+        let keys = crate::plugin::ui::sort_keys(plugin_id, contribution_id);
+        if keys.is_empty() {
+            return;
+        }
+        let key_of = |item: &Item| -> f64 {
+            match item {
+                Item::Session { id, .. } => keys.get(id).copied().unwrap_or(f64::NEG_INFINITY),
+                Item::Group { .. } => f64::NEG_INFINITY,
+            }
+        };
+        let mut i = 0;
+        while i < items.len() {
+            if matches!(items[i], Item::Session { .. }) {
+                let start = i;
+                while i < items.len() && matches!(items[i], Item::Session { .. }) {
+                    i += 1;
+                }
+                items[start..i].sort_by(|a, b| {
+                    key_of(b)
+                        .partial_cmp(&key_of(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn build_flat_items_core(&self) -> Vec<Item> {
         // Project grouping is honored across every sort order. Combined with
         // Attention sort, sessions sort by tier within each project and the
         // project headers float by their top-attention member (driven by
@@ -4018,7 +4076,10 @@ impl HomeView {
 
     /// Show the sort-order picker dialog seeded with the current order.
     pub(super) fn show_sort_picker(&mut self) {
-        self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
+        self.sort_picker_dialog = Some(SortPickerDialog::new(
+            self.sort_order,
+            self.plugin_sort.clone(),
+        ));
     }
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {

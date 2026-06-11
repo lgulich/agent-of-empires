@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod sandbox;
 pub mod settings;
 pub mod status;
+pub mod ui;
 pub mod update_check;
 
 use std::path::PathBuf;
@@ -110,5 +111,9 @@ pub fn reload_registry() -> Arc<PluginRegistry> {
     *REGISTRY.write().expect("plugin registry lock") = Some(reg.clone());
     status::invalidate_cache();
     host::host().reset();
+    // UI state of plugins that are no longer active must vanish with them.
+    let active: std::collections::HashSet<String> =
+        reg.active().map(|p| p.id().to_string()).collect();
+    ui::evict_except(&active);
     reg
 }

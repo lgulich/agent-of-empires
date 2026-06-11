@@ -667,6 +667,12 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_image_digest: Option<String>,
 
+    /// Active plugin-contributed sort mode, `<plugin-id>/<contribution-id>`.
+    /// Composes on top of `sort_order` (sessions re-rank inside groups);
+    /// cleared by picking any core sort order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_sort: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 

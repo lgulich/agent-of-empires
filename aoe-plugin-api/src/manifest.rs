@@ -35,7 +35,72 @@ pub struct PluginManifest {
     pub themes: Vec<ThemeContribution>,
     #[serde(default)]
     pub status_detection: Vec<StatusDetectionContribution>,
+    #[serde(default)]
+    pub ui: Vec<UiContribution>,
     pub runtime: Option<RuntimeContribution>,
+}
+
+/// One typed contribution to a fixed UI extension point. The host renders
+/// every slot with its own widgets (TUI) and components (web); the plugin's
+/// worker pushes display state for its declared contributions through the
+/// `ui.state.set` host RPC and never participates in the render path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiContribution {
+    /// Contribution id, unique within the plugin, e.g. `attention_badge`.
+    pub id: String,
+    pub slot: UiSlot,
+    /// Shown by the host where the slot needs a heading (column header,
+    /// panel title, sort mode name).
+    pub title: String,
+    /// Orders contributions sharing a slot; higher renders first.
+    #[serde(default)]
+    pub priority: i32,
+}
+
+/// The fixed extension points plugins may contribute UI to. Global slots
+/// hold one state per contribution; session slots hold one per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiSlot {
+    /// Short global text in the TUI status bar and the web top bar.
+    StatusBarSegment,
+    /// Block-content card on the global overview surfaces.
+    DashboardCard,
+    /// Small per-session label in the session list row.
+    SessionListRowBadge,
+    /// Extra per-session cell with a header in the session list.
+    SessionListColumn,
+    /// Per-session numeric key exposed as a selectable sort mode; never
+    /// overrides the default order silently.
+    SessionListSortKey,
+    /// Per-session facet values the list can filter on.
+    SessionListFilterFacet,
+    /// Small per-session annotation next to the session title.
+    SessionDetailHeaderBadge,
+    /// Block-content panel on the session detail surfaces.
+    SessionDetailPanel,
+}
+
+impl UiSlot {
+    /// Whether state for this slot is keyed per session (vs one global).
+    pub fn session_scoped(self) -> bool {
+        !matches!(self, UiSlot::StatusBarSegment | UiSlot::DashboardCard)
+    }
+
+    /// Kebab-case form used in manifests and API payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiSlot::StatusBarSegment => "status-bar-segment",
+            UiSlot::DashboardCard => "dashboard-card",
+            UiSlot::SessionListRowBadge => "session-list-row-badge",
+            UiSlot::SessionListColumn => "session-list-column",
+            UiSlot::SessionListSortKey => "session-list-sort-key",
+            UiSlot::SessionListFilterFacet => "session-list-filter-facet",
+            UiSlot::SessionDetailHeaderBadge => "session-detail-header-badge",
+            UiSlot::SessionDetailPanel => "session-detail-panel",
+        }
+    }
 }
 
 /// One setting rendered generically on the TUI and web settings surfaces,
@@ -335,15 +400,33 @@ impl PluginManifest {
             }
         }
 
+        let mut ui_ids = std::collections::HashSet::new();
+        for ui in &self.ui {
+            check(
+                is_key(&ui.id),
+                format!("ui contribution id {:?} must be snake_case", ui.id),
+            );
+            check(
+                ui_ids.insert(ui.id.as_str()),
+                format!("duplicate ui contribution id {:?}", ui.id),
+            );
+            check(
+                !ui.title.is_empty(),
+                format!("ui contribution {:?} needs a title", ui.id),
+            );
+        }
+
         let needs_runtime = !self.commands.is_empty()
             || !self.actions.is_empty()
+            || !self.ui.is_empty()
             || self
                 .status_detection
                 .iter()
                 .any(|d| matches!(d.mode, DetectionMode::Rpc { .. }));
         check(
             !needs_runtime || self.runtime.is_some(),
-            "commands, actions, and rpc status detection require a [runtime] section".into(),
+            "commands, actions, ui contributions, and rpc status detection require a [runtime] section"
+                .into(),
         );
 
         if errors.is_empty() {

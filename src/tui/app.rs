@@ -608,6 +608,7 @@ impl App {
         // typing-echo case where 33ms would feel laggy.
         let mut refresh_interval = tokio::time::interval(Duration::from_millis(33));
         refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_plugin_ui_revision = crate::plugin::ui::revision();
         // After any keystroke routed to live-send, schedule one extra
         // refresh ~15ms later (roughly the `tmux send-keys` fork plus
         // agent-echo time) so the resulting capture catches the echo
@@ -1229,6 +1230,16 @@ impl App {
             }
             if self.poll_image_pull_status() {
                 self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            // Plugin UI pushes (badges, segments, panels, notifications)
+            // bump a revision counter; one atomic load per tick keeps the
+            // home view current without the draw path ever touching a
+            // worker.
+            let plugin_ui_revision = crate::plugin::ui::revision();
+            if plugin_ui_revision != last_plugin_ui_revision {
+                last_plugin_ui_revision = plugin_ui_revision;
                 refresh_needed = true;
                 needs_full_refresh = true;
             }

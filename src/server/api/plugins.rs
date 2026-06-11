@@ -107,6 +107,17 @@ pub async fn check_plugin_updates() -> Response {
     }
 }
 
+/// `GET /api/ui/state`: every live plugin UI contribution entry plus the
+/// notification ring, with a revision counter the client polls against.
+/// Read-only cache snapshot; never touches a plugin worker.
+pub async fn get_plugin_ui_state() -> Json<serde_json::Value> {
+    Json(json!({
+        "revision": plugin::ui::revision(),
+        "entries": plugin::ui::all_entries(),
+        "notifications": plugin::ui::notifications(),
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct SetEnabledBody {
     pub enabled: bool,

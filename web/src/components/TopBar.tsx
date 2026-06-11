@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { PluginTopBarItems } from "./PluginUi";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 
 interface Props {
@@ -121,6 +122,7 @@ export function TopBar({
           rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
         }`}
       >
+        <PluginTopBarItems activeSessionId={activeSession?.id ?? null} />
         {isDevBuild && (
           <span
             className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30"

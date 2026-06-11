@@ -237,6 +237,62 @@ export function fetchPluginUpdates(): Promise<{ updates: Record<string, PluginUp
   return fetchJson<{ updates: Record<string, PluginUpdateStatus> }>("/api/plugins/updates");
 }
 
+/** One block inside a plugin dashboard card / session panel. */
+export type PluginUiBlock =
+  | { type: "text"; text: string; severity?: PluginUiSeverity }
+  | { type: "kv"; items: [string, string][] }
+  | { type: "list"; items: string[] }
+  | { type: "metric"; label: string; value: string };
+
+export type PluginUiSeverity = "info" | "success" | "warning" | "error";
+
+/** Typed payload of one plugin UI contribution entry. */
+export type PluginUiPayload =
+  | { kind: "badge"; text: string; severity?: PluginUiSeverity; tooltip?: string }
+  | { kind: "cell"; text: string; severity?: PluginUiSeverity; sort_key?: number | null }
+  | { kind: "sort_key"; key: number; reason?: string }
+  | { kind: "facets"; values: string[] }
+  | { kind: "blocks"; severity?: PluginUiSeverity; blocks: PluginUiBlock[] };
+
+export type PluginUiSlot =
+  | "status-bar-segment"
+  | "dashboard-card"
+  | "session-list-row-badge"
+  | "session-list-column"
+  | "session-list-sort-key"
+  | "session-list-filter-facet"
+  | "session-detail-header-badge"
+  | "session-detail-panel";
+
+export interface PluginUiEntry {
+  plugin_id: string;
+  contribution_id: string;
+  slot: PluginUiSlot;
+  title: string;
+  priority: number;
+  session_id?: string;
+  payload: PluginUiPayload;
+}
+
+export interface PluginNotification {
+  plugin_id: string;
+  title: string;
+  body: string;
+  severity: PluginUiSeverity;
+  session_id?: string;
+  seq: number;
+}
+
+export interface PluginUiState {
+  revision: number;
+  entries: PluginUiEntry[];
+  notifications: PluginNotification[];
+}
+
+export function fetchPluginUiState(): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/ui/state");
+}
+
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<boolean> {
   try {
     const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {

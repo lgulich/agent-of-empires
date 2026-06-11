@@ -1129,11 +1129,9 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.sort_picker_dialog = None;
                 }
-                DialogResult::Submit(order) => {
+                DialogResult::Submit(choice) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_choice(choice);
                 }
             }
             return true;
@@ -1910,6 +1908,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.plugin_panels_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.plugin_panels_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -1949,11 +1957,9 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.sort_picker_dialog = None;
                 }
-                DialogResult::Submit(order) => {
+                DialogResult::Submit(choice) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_choice(choice);
                 }
             }
             return None;
@@ -2337,6 +2343,14 @@ impl HomeView {
             }
             ActionId::Plugins => {
                 self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
+            ActionId::PluginPanels => {
+                let session = self.selected_session.as_ref().and_then(|id| {
+                    self.get_instance(id)
+                        .map(|inst| (id.clone(), inst.title.clone()))
+                });
+                self.plugin_panels_dialog =
+                    Some(crate::tui::dialogs::PluginPanelsDialog::new(session));
             }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
@@ -3084,8 +3098,33 @@ impl HomeView {
         self.update_selected();
     }
 
+    /// Apply a sort-picker selection. A core order clears any plugin sort
+    /// mode; a plugin mode keeps the core order and re-ranks on top.
+    pub(super) fn apply_sort_choice(
+        &mut self,
+        choice: crate::tui::dialogs::sort_picker::SortChoice,
+    ) {
+        match choice {
+            crate::tui::dialogs::sort_picker::SortChoice::Core(order) => {
+                self.plugin_sort = None;
+                self.apply_sort_order(order);
+            }
+            crate::tui::dialogs::sort_picker::SortChoice::Plugin {
+                plugin_id,
+                contribution_id,
+            } => {
+                self.plugin_sort = Some((plugin_id, contribution_id));
+                self.resort_and_persist();
+            }
+        }
+    }
+
     fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
+        self.resort_and_persist();
+    }
+
+    fn resort_and_persist(&mut self) {
         self.flat_items = self.build_flat_items();
         if self.search_active && !self.search_query.value().is_empty() {
             self.update_search();
@@ -3094,6 +3133,8 @@ impl HomeView {
         }
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
             config.app_state.sort_order = Some(self.sort_order);
+            config.app_state.plugin_sort =
+                self.plugin_sort.as_ref().map(|(p, c)| format!("{p}/{c}"));
             if let Err(e) = save_config(&config) {
                 tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
             }
@@ -4512,6 +4553,17 @@ impl HomeView {
     }
 
     /// Re-score matches after a reload without moving the cursor.
+    /// Plugin filter facets ride the same haystack as title and path, so
+    /// typing a facet value (e.g. "blocked") filters the list.
+    fn search_haystack_for(inst: &crate::session::Instance) -> String {
+        let facets = crate::plugin::ui::facet_haystack(&inst.id);
+        if facets.is_empty() {
+            format!("{} {}", inst.title, inst.project_path)
+        } else {
+            format!("{} {} {}", inst.title, inst.project_path, facets)
+        }
+    }
+
     pub(super) fn refresh_search_matches(&mut self) {
         let query = self.search_query.value();
         if query.is_empty() {
@@ -4539,7 +4591,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }
@@ -4593,7 +4645,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }

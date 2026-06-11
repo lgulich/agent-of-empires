@@ -63,6 +63,8 @@ pub enum ActionId {
     NextWaiting,
     /// Open the plugin manager (palette only; no default chord).
     Plugins,
+    /// Open plugin-contributed panels and notifications (palette only).
+    PluginPanels,
     /// Pin or unpin the selected project header (project view only). Pinning
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
@@ -700,6 +702,20 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette-only: plugin-contributed panels, cards, and notifications.
+    Binding {
+        id: ActionId::PluginPanels,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Plugin panels",
+            keywords: &["plugin", "panel", "card", "notification", "dashboard"],
+            group: PaletteGroup::Views,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// A keybind contributed by an active plugin's manifest, resolved at runtime
@@ -880,6 +896,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
         ActionId::Plugins => "plugins",
+        ActionId::PluginPanels => "plugin-panels",
     }
 }
 

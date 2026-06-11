@@ -109,6 +109,31 @@ aoe settings explain <plugin-id>.<key>     # plugin setting
 aoe settings explain session.yolo_mode_default   # core setting
 ```
 
+## Plugin UI contributions
+
+Plugins can add UI to fixed extension points on both surfaces; the host
+renders everything with its own widgets, and plugin workers only push small
+typed state through the host API (never code, never HTML). Slots:
+
+- `status-bar-segment`: short global text in the TUI status bar and the web
+  top bar.
+- `session-list-row-badge` / `session-list-column`: per-session badges and
+  cells in the session list (TUI rows and the web sidebar).
+- `session-list-sort-key`: a selectable sort mode (TUI sort picker); it
+  never replaces your chosen order silently, it re-ranks sessions on top of
+  it and is cleared by picking any core order.
+- `session-list-filter-facet`: per-session facet values; typing a facet
+  value in the TUI search filters the list.
+- `dashboard-card` / `session-detail-panel` / `session-detail-header-badge`:
+  block content (text, key-value, list, metric), shown in the TUI "Plugin
+  panels" view (command palette) and the web top-bar flag popover.
+- Notifications: plugins can emit host-rendered notifications; the newest
+  shows in the status bar / top bar, the full ring in the panels view.
+
+State is ephemeral and capped; disabling a plugin removes its UI instantly.
+The session list and status bar never wait on a plugin: they render
+whatever state was last pushed.
+
 ## Writing a plugin
 
 A plugin is a directory with an `aoe-plugin.toml` manifest declaring its
