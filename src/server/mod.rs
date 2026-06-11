@@ -609,15 +609,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     raise_fd_limit();
 
-    // Opt-in plugin auto-update, same hook as the TUI startup: results go
-    // to the log; capability-changing updates auto-decline inside the sweep.
-    if crate::session::Config::load_or_warn()
-        .updates
-        .auto_update_plugins
-    {
-        tokio::task::spawn_blocking(crate::plugin::update_check::auto_update_and_log);
-    }
-
     // Single live `FileWatchService` per daemon. Threaded into AppState
     // and into every `Storage::new` call so in-process writes surface via
     // `notify_local_change` and per-profile subscriptions multiplex
@@ -659,6 +650,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_grace,
     ));
     let config = crate::session::profile_config::resolve_config_or_warn(profile);
+
+    // Opt-in plugin auto-update, same hook as the TUI startup: results go
+    // to the log; capability-changing updates auto-decline inside the
+    // sweep. Gated on the PROFILE-RESOLVED config, since this server run is
+    // profile-scoped like everything below.
+    if config.updates.auto_update_plugins {
+        tokio::task::spawn_blocking(crate::plugin::update_check::auto_update_and_log);
+    }
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
