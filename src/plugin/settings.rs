@@ -238,12 +238,22 @@ pub fn resolve_all(registry: &PluginRegistry) -> Vec<ResolvedSetting> {
         .collect();
     core_targets.sort();
     core_targets.dedup();
+    // One disk read + parse for the whole pass, not one per overridden key:
+    // this runs straight from the async /api/settings/resolved handler.
+    let snapshot = on_disk_table();
     for (section, field) in core_targets {
-        if let Some(resolved) = resolve_core(registry, &section, &field) {
+        if let Some(resolved) = resolve_core_with(registry, &section, &field, snapshot.as_ref()) {
             all.push(resolved);
         }
     }
     all
+}
+
+/// The raw (untyped, override-free) config.toml table, if readable.
+fn on_disk_table() -> Option<toml::Table> {
+    let path = crate::session::config::config_path().ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<toml::Table>(&raw).ok()
 }
 
 /// Resolve a CORE setting's default chain: explicit user value (an on-disk
@@ -255,17 +265,22 @@ pub fn resolve_core(
     section: &str,
     field: &str,
 ) -> Option<ResolvedSetting> {
+    resolve_core_with(registry, section, field, on_disk_table().as_ref())
+}
+
+fn resolve_core_with(
+    registry: &PluginRegistry,
+    section: &str,
+    field: &str,
+    on_disk: Option<&toml::Table>,
+) -> Option<ResolvedSetting> {
     if !super::core_overrides::is_core_field(section, field) {
         return None;
     }
     let builtin = super::core_overrides::builtin_default(section, field);
     let mut candidates: Vec<SettingCandidate> = Vec::new();
 
-    let on_disk = crate::session::config::config_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| toml::from_str::<toml::Table>(&raw).ok())
-        .and_then(|t| t.get(section)?.get(field).cloned());
+    let on_disk = on_disk.and_then(|t| t.get(section)?.get(field).cloned());
     if let Some(value) = on_disk {
         if builtin.as_ref() != Some(&value) {
             candidates.push(SettingCandidate {
