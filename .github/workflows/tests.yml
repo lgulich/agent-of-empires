@@ -87,13 +87,13 @@ jobs:
       # gate, so the ~27 cfg(feature = "serve") sites can't rot.
       - name: Cargo test (TUI-only, plugins disabled)
         if: runner.os == 'Linux'
-        run: cargo test --no-default-features --features no-default-plugins --lib --bins
+        run: cargo test --no-default-features --lib --bins
       # The third feature corner: serve off, builtin plugins on. Compile
       # gate (including test/e2e targets, which plain check skips) so
       # plugin registration code that assumes serve types can't sneak in.
       - name: Cargo check (TUI-only, default plugins)
         if: runner.os == 'Linux'
-        run: cargo check --no-default-features --all-targets
+        run: cargo check --no-default-features --features default-plugins --all-targets
 
   macos-acp-e2e:
     # The acp live-daemon e2e tests exercise the structured-view

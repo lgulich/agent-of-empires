@@ -30,17 +30,17 @@ pub struct BuiltinPlugin {
 /// (status detection, attention sort). Kept in `plugins/` in the repository
 /// so they can move to their own repo without touching host code.
 pub static BUILTINS: &[BuiltinPlugin] = &[
-    #[cfg(not(feature = "no-default-plugins"))]
+    #[cfg(feature = "default-plugins")]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-status/aoe-plugin.toml"),
     },
-    #[cfg(not(feature = "no-default-plugins"))]
+    #[cfg(feature = "default-plugins")]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-attention/aoe-plugin.toml"),
     },
     // The web dashboard's management marker only exists when the dashboard
     // is compiled in at all.
-    #[cfg(all(feature = "serve", not(feature = "no-default-plugins")))]
+    #[cfg(all(feature = "serve", feature = "default-plugins"))]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
     },
