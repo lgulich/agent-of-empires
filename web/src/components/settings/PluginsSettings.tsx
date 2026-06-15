@@ -180,6 +180,13 @@ export function PluginsSettings() {
       )}
 
       <div className="space-y-3">
+        <p className="text-sm font-medium">Installed plugins</p>
+        {data && data.plugins.length === 0 && (
+          <p className="text-xs text-text-dim" data-testid="plugins-empty">
+            No plugins detected. Bundled plugins ship with the full build; install one below or discover community
+            plugins.
+          </p>
+        )}
         {data?.plugins.map((plugin) => (
           <div
             key={plugin.id}

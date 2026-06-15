@@ -235,6 +235,13 @@ describe("PluginsSettings contract", () => {
     });
   });
 
+  it("renders an explicit empty state instead of a blank section when no plugins are present", async () => {
+    fetchPlugins.mockResolvedValue(listResponse({ plugins: [] }));
+    const { findByText, getByTestId } = render(<PluginsSettings />);
+    await findByText("Installed plugins");
+    expect(getByTestId("plugins-empty").textContent).toContain("No plugins detected");
+  });
+
   it("load errors are surfaced, not swallowed", async () => {
     fetchPlugins.mockResolvedValue(listResponse({ load_errors: ["plugins/bad: manifest is invalid"] }));
     const { findByText } = render(<PluginsSettings />);
