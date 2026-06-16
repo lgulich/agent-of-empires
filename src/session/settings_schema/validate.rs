@@ -49,6 +49,33 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
             }
             Ok(())
         }
+        ValidationKind::RangeI64 { min, max } => {
+            let n = value
+                .as_i64()
+                .ok_or_else(|| ValidationError::new("expected an integer"))?;
+            if n < *min {
+                return Err(ValidationError::new(format!("must be at least {min}")));
+            }
+            if let Some(max) = max {
+                if n > *max {
+                    return Err(ValidationError::new(format!("must be at most {max}")));
+                }
+            }
+            Ok(())
+        }
+        ValidationKind::OneOf { options } => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| ValidationError::new("expected a string"))?;
+            if options.iter().any(|o| o == s) {
+                Ok(())
+            } else {
+                Err(ValidationError::new(format!(
+                    "must be one of: {}",
+                    options.join(", ")
+                )))
+            }
+        }
         ValidationKind::NonEmptyString => {
             let s = value
                 .as_str()
@@ -113,6 +140,31 @@ mod tests {
         let kind = ValidationKind::RangeU64 { min: 0, max: None };
         assert!(validate_value(&kind, &json!("nope")).is_err());
         assert!(validate_value(&kind, &json!(-1)).is_err());
+    }
+
+    #[test]
+    fn range_i64_allows_negative_and_rejects_out_of_bounds() {
+        let kind = ValidationKind::RangeI64 {
+            min: -10,
+            max: Some(10),
+        };
+        assert!(validate_value(&kind, &json!(-10)).is_ok());
+        assert!(validate_value(&kind, &json!(0)).is_ok());
+        assert!(validate_value(&kind, &json!(10)).is_ok());
+        assert!(validate_value(&kind, &json!(-11)).is_err());
+        assert!(validate_value(&kind, &json!(11)).is_err());
+        assert!(validate_value(&kind, &json!(1.5)).is_err());
+        assert!(validate_value(&kind, &json!("3")).is_err());
+    }
+
+    #[test]
+    fn one_of_rejects_undeclared_option() {
+        let kind = ValidationKind::OneOf {
+            options: vec!["red".into(), "green".into()],
+        };
+        assert!(validate_value(&kind, &json!("red")).is_ok());
+        assert!(validate_value(&kind, &json!("blue")).is_err());
+        assert!(validate_value(&kind, &json!(1)).is_err());
     }
 
     #[test]

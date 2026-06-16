@@ -139,7 +139,7 @@ fn descriptor_for(plugin_id: &str, setting: &SettingContribution) -> FieldDescri
         widget: widget_for(&setting.widget),
         web_write: WebWritePolicy::Allow,
         profile_overridable: false,
-        validation: ValidationKind::None,
+        validation: validation_for(&setting.widget),
         advanced: false,
     }
 }
@@ -152,8 +152,8 @@ fn widget_for(widget: &SettingWidget) -> WidgetKind {
             mono: false,
         },
         SettingWidget::Number { min, max } => WidgetKind::Number {
-            min: min.map(|v| v as i64),
-            max: max.map(|v| v as i64),
+            min: *min,
+            max: *max,
         },
         SettingWidget::Select { options } => WidgetKind::Select {
             options: options
@@ -161,6 +161,23 @@ fn widget_for(widget: &SettingWidget) -> WidgetKind {
                 .map(|value| SelectOption::new(value, value))
                 .collect(),
         },
+    }
+}
+
+/// Server-authoritative validation derived from a plugin widget, so a web
+/// PATCH is held to the manifest's bounds and option set instead of treating
+/// them as advisory UI hints (the single-source schema gate AGENTS.md
+/// mandates). Number with no lower bound still pins the value to an integer.
+fn validation_for(widget: &SettingWidget) -> ValidationKind {
+    match widget {
+        SettingWidget::Number { min, max } => ValidationKind::RangeI64 {
+            min: min.unwrap_or(i64::MIN),
+            max: *max,
+        },
+        SettingWidget::Select { options } => ValidationKind::OneOf {
+            options: options.clone(),
+        },
+        SettingWidget::Toggle | SettingWidget::Text => ValidationKind::None,
     }
 }
 
@@ -205,7 +222,7 @@ fn widget_default(widget: &SettingWidget) -> Value {
     match widget {
         SettingWidget::Toggle => json!(false),
         SettingWidget::Text => json!(""),
-        SettingWidget::Number { min, .. } => json!(min.unwrap_or(0.0)),
+        SettingWidget::Number { min, .. } => json!(min.unwrap_or(0)),
         SettingWidget::Select { options } => json!(options.first().cloned().unwrap_or_default()),
     }
 }
@@ -389,6 +406,40 @@ fn resolve_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_widgets_carry_server_authoritative_validation() {
+        assert_eq!(
+            validation_for(&SettingWidget::Number {
+                min: Some(1),
+                max: Some(100)
+            }),
+            ValidationKind::RangeI64 {
+                min: 1,
+                max: Some(100)
+            }
+        );
+        // No lower bound still pins the value to an integer.
+        assert_eq!(
+            validation_for(&SettingWidget::Number {
+                min: None,
+                max: None
+            }),
+            ValidationKind::RangeI64 {
+                min: i64::MIN,
+                max: None
+            }
+        );
+        assert_eq!(
+            validation_for(&SettingWidget::Select {
+                options: vec!["a".into(), "b".into()]
+            }),
+            ValidationKind::OneOf {
+                options: vec!["a".into(), "b".into()]
+            }
+        );
+        assert_eq!(validation_for(&SettingWidget::Toggle), ValidationKind::None);
+    }
 
     #[test]
     fn virtual_section_round_trips() {

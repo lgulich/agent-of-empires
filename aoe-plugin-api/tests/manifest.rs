@@ -164,6 +164,28 @@ method = "status.detect_batch"
 }
 
 #[test]
+fn fractional_number_bound_fails_to_parse() {
+    let err = PluginManifest::from_toml_str(
+        r#"
+id = "acme.fract"
+name = "Fractional"
+version = "0.1.0"
+
+[[settings]]
+key = "threshold"
+label = "Threshold"
+widget = { kind = "number", min = 0.5, max = 10 }
+"#,
+    )
+    .unwrap_err();
+    // A fractional bound is a loud TOML type error, not a silent truncation.
+    assert!(
+        matches!(err, ManifestError::Parse(_)),
+        "expected a parse error, got {err:?}"
+    );
+}
+
+#[test]
 fn traversal_and_absolute_entrypoints_are_rejected() {
     for ep in ["/bin/sh", "../../bin/python3", "sub/../../escape", ""] {
         let all = invalid_messages(&format!(

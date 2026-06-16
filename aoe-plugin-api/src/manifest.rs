@@ -125,8 +125,16 @@ pub struct SettingContribution {
 pub enum SettingWidget {
     Toggle,
     Text,
-    Number { min: Option<f64>, max: Option<f64> },
-    Select { options: Vec<String> },
+    /// Integer input with optional inclusive bounds. Bounds are `i64`, matching
+    /// the host's integer settings; a fractional bound (`min = 0.5`) is a loud
+    /// TOML type error at parse rather than a silently truncated `0`.
+    Number {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    Select {
+        options: Vec<String>,
+    },
 }
 
 /// Override of another setting's default, resolved by priority.

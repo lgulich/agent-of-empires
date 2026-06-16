@@ -112,6 +112,18 @@ pub enum ValidationKind {
         min: u64,
         max: Option<u64>,
     },
+    /// Signed inclusive range. Plugin `Number` widgets map here so their
+    /// manifest bounds are server-authoritative, not advisory UI metadata.
+    RangeI64 {
+        min: i64,
+        max: Option<i64>,
+    },
+    /// Value must be one of a closed set of strings. Plugin `Select` widgets
+    /// map here so a web PATCH cannot write an option the manifest never
+    /// declared.
+    OneOf {
+        options: Vec<String>,
+    },
     /// Non-empty after trimming.
     NonEmptyString,
     /// Docker memory-limit grammar (`512m`, `2g`, ...). Empty allowed.
