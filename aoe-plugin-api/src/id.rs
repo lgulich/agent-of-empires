@@ -54,6 +54,21 @@ impl PluginId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this id sits in a namespace reserved for first-party plugins:
+    /// `aoe.*` (bundled builtins) and `agent-of-empires.*` (official plugins
+    /// shipped through the featured index). The host lets a community install
+    /// use a reserved namespace only when the source is featured-verified, so
+    /// a third party cannot publish as `aoe.web` or `agent-of-empires.github`
+    /// and usurp the builtin/official id, the telemetry allowlist, or the
+    /// `plugin_meta` namespace. Builtin manifests are loaded from inside the
+    /// binary and never pass through that install gate.
+    pub fn is_reserved_namespace(&self) -> bool {
+        matches!(
+            self.0.split('.').next(),
+            Some("aoe") | Some("agent-of-empires")
+        )
+    }
 }
 
 impl fmt::Display for PluginId {
@@ -99,6 +114,22 @@ mod tests {
             "aoe.st at",
         ] {
             assert!(PluginId::new(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn reserved_namespace_policy_is_pinned() {
+        for reserved in ["aoe.status", "aoe.web", "agent-of-empires.github"] {
+            assert!(
+                PluginId::new(reserved).unwrap().is_reserved_namespace(),
+                "{reserved} should be reserved"
+            );
+        }
+        for open in ["someuser.review-helper", "acme.review", "aoextra.thing"] {
+            assert!(
+                !PluginId::new(open).unwrap().is_reserved_namespace(),
+                "{open} should be open"
+            );
         }
     }
 

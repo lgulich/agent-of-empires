@@ -209,6 +209,18 @@ pub fn install(
     }
 
     let featured = featured_validation(&source, &staged)?;
+    // The aoe.* and agent-of-empires.* namespaces are first-party. A community
+    // install may use one only when the source is featured (the index pins
+    // that slug to that id, so it is the genuine official plugin, e.g.
+    // agent-of-empires.github from agent-of-empires/plugin-github); otherwise
+    // a third party could squat the builtin/official id and usurp the
+    // telemetry allowlist and plugin_meta namespace.
+    if staged.manifest.id.is_reserved_namespace() && featured == FeaturedValidation::NotFeatured {
+        bail!(
+            "plugin id {id:?} uses a reserved namespace (aoe.* / agent-of-empires.*); \
+             only first-party builtins and featured plugins may use it"
+        );
+    }
     let staged_hash = manifest_hash(staged.manifest_raw.as_bytes());
     let prompt = InstallPrompt {
         id: id.clone(),
