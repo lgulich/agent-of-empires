@@ -276,6 +276,12 @@ pub fn install(
     })();
     if let Err(e) = metadata {
         std::fs::remove_dir_all(&dest).ok();
+        // A fresh install writes the grant first; if a later metadata write
+        // failed, the tree is gone but grants.toml would keep an orphan entry
+        // for an id that is not installed. Drop it so a later reinstall starts
+        // clean.
+        GrantStore::load().and_then(|mut g| g.revoke(&id)).ok();
+        Lockfile::load().and_then(|mut l| l.remove(&id)).ok();
         return Err(e);
     }
     super::reload_registry();
@@ -365,6 +371,13 @@ pub fn update(
     // writes below must build on current disk state, not the stale snapshot.
     let mut grants = GrantStore::load()?;
     let mut lockfile = Lockfile::load()?;
+    // Snapshots to restore on a partial write: grants.grant persists
+    // immediately, so a later lockfile failure would otherwise leave the grant
+    // pinned to the new hash while the tree rolls back to the old one, marking
+    // the plugin falsely Stale (apparently revoked) even though nothing
+    // changed.
+    let prior_grant = grants.record(plugin_id).cloned();
+    let prior_lock = lockfile.get(plugin_id).cloned();
     let dest = super::plugins_dir()?.join(plugin_id);
     let backup = dest.with_extension("updating");
     if backup.exists() {
@@ -403,11 +416,23 @@ pub fn update(
         }
         Err(e) => {
             // Roll the old tree back so a failed update never leaves a hole
-            // or a half-updated install.
+            // or a half-updated install, and restore both metadata stores to
+            // their pre-update state so a grant/lockfile write that landed
+            // before the failure cannot desync from the restored tree.
             std::fs::remove_dir_all(&dest).ok();
             if backup.exists() {
                 std::fs::rename(&backup, &dest).ok();
             }
+            match prior_grant {
+                Some(g) => grants
+                    .grant(plugin_id, g.manifest_hash, g.capabilities)
+                    .ok(),
+                None => grants.revoke(plugin_id).ok(),
+            };
+            match prior_lock {
+                Some(rec) => lockfile.upsert(plugin_id, rec).ok(),
+                None => lockfile.remove(plugin_id).ok(),
+            };
             return Err(e);
         }
     }
