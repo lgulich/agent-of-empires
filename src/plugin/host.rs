@@ -172,13 +172,7 @@ impl PluginHost {
 
     /// Kill and forget every worker. Called on daemon/TUI shutdown.
     pub fn shutdown(&self) {
-        let workers: Vec<Arc<Worker>> = self
-            .workers
-            .lock()
-            .expect("workers lock")
-            .drain()
-            .map(|(_, w)| w)
-            .collect();
+        let workers: Vec<Arc<Worker>> = self.workers.lock_safe().drain().map(|(_, w)| w).collect();
         for worker in workers {
             self.mark_dead(&worker);
         }
