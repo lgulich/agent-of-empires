@@ -59,8 +59,17 @@ pub fn check_one(record: &LockRecord) -> UpdateStatus {
 
 fn remote_head(slug: &str) -> Result<String> {
     let url = format!("https://github.com/{slug}.git");
+    // Same slowloris guard as the clone: abort if the remote stalls.
     let output = std::process::Command::new("git")
-        .args(["ls-remote", &url, "HEAD"])
+        .args([
+            "-c",
+            "http.lowSpeedLimit=1024",
+            "-c",
+            "http.lowSpeedTime=15",
+            "ls-remote",
+            &url,
+            "HEAD",
+        ])
         .output()
         .context("running git ls-remote")?;
     if !output.status.success() {

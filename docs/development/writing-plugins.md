@@ -456,6 +456,11 @@ Publish the plugin directory as a GitHub repository with
 search) lists repositories with that topic, featured first, and users
 install with `aoe plugin install owner/repo`.
 
+Keep everything the plugin needs in the repository itself. Install does a
+shallow `git clone` (`--depth 1`, blobs capped at 10 MB) and does NOT recurse
+submodules, so a submodule's contents are absent at runtime (its gitlink
+hashes as empty). Symlinks in the tree are rejected outright.
+
 To get a release featured (vouched for by the AoE maintainers and
 hash-verified on install), it has to be pinned in `plugins/featured.toml`.
 A maintainer does that with the xtask helper, which clones the default

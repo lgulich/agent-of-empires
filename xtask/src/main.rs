@@ -697,7 +697,17 @@ fn feature_plugin(args: FeaturePluginArgs) {
     let url = format!("https://github.com/{slug}.git");
     println!("Cloning {url} ...");
     let cloned = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", &url])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:limit=10m",
+            "-c",
+            "http.lowSpeedLimit=1024",
+            "-c",
+            "http.lowSpeedTime=30",
+            &url,
+        ])
         .arg(&dest)
         .status()
         .expect("running git clone");

@@ -136,8 +136,23 @@ fn stage(source: &PluginSource) -> Result<Staged> {
             let tmp = tempfile::tempdir().context("creating staging dir")?;
             let url = format!("https://github.com/{slug}.git");
             let dest = tmp.path().join("plugin");
+            // Hardening for an attacker-controlled remote: --filter skips
+            // oversized blobs, and the low-speed config makes git abort a
+            // slowloris transfer (< 1 KB/s for 30s) instead of holding a
+            // blocking task open indefinitely. Submodules are NOT recursed;
+            // a gitlink stays bodyless in the tree.
             let output = std::process::Command::new("git")
-                .args(["clone", "--depth", "1", &url])
+                .args([
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--filter=blob:limit=10m",
+                    "-c",
+                    "http.lowSpeedLimit=1024",
+                    "-c",
+                    "http.lowSpeedTime=30",
+                    &url,
+                ])
                 .arg(&dest)
                 .output()
                 .context("running git clone")?;
