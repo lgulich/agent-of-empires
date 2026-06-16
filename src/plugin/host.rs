@@ -246,7 +246,26 @@ fn worker_command(plugin: &LoadedPlugin) -> Result<(PathBuf, Vec<String>, PathBu
                     entrypoint.display()
                 );
             }
-            Ok((entrypoint, runtime.args.clone(), root.clone()))
+            // Path::join does not normalize, so an entrypoint of "/bin/sh"
+            // (absolute) or "../../bin/python3" (traversal) escapes the plugin
+            // root and spawns a host binary the capability prompt never named.
+            // Manifest validation rejects those shapes at parse time; this is
+            // the spawn-time backstop (also resolves a symlinked root like
+            // /tmp -> /private/tmp consistently).
+            let canon_root = root
+                .canonicalize()
+                .with_context(|| format!("canonicalizing plugin root {}", root.display()))?;
+            let canon_entry = entrypoint
+                .canonicalize()
+                .with_context(|| format!("canonicalizing entrypoint {}", entrypoint.display()))?;
+            if !canon_entry.starts_with(&canon_root) {
+                bail!(
+                    "plugin {} entrypoint resolves outside the plugin root: {}",
+                    plugin.id(),
+                    canon_entry.display()
+                );
+            }
+            Ok((canon_entry, runtime.args.clone(), root.clone()))
         }
         None => {
             let exe = std::env::current_exe().context("resolving current executable")?;

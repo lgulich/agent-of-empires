@@ -429,6 +429,25 @@ impl PluginManifest {
                 .into(),
         );
 
+        if let Some(runtime) = &self.runtime {
+            let ep = std::path::Path::new(&runtime.entrypoint);
+            let traversal = ep.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            });
+            check(
+                !runtime.entrypoint.is_empty() && !traversal,
+                format!(
+                    "runtime.entrypoint {:?} must be a relative path inside the plugin (no leading \"/\", drive prefix, or \"..\")",
+                    runtime.entrypoint
+                ),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

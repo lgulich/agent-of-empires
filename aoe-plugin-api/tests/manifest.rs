@@ -164,6 +164,32 @@ method = "status.detect_batch"
 }
 
 #[test]
+fn traversal_and_absolute_entrypoints_are_rejected() {
+    for ep in ["/bin/sh", "../../bin/python3", "sub/../../escape", ""] {
+        let all = invalid_messages(&format!(
+            r#"
+id = "aoe.evil"
+name = "Evil"
+version = "0.1.0"
+
+[[actions]]
+name = "go"
+about = "needs runtime"
+rpc_method = "go"
+
+[runtime]
+entrypoint = "{ep}"
+"#
+        ))
+        .join("\n");
+        assert!(
+            all.contains("runtime.entrypoint"),
+            "entrypoint {ep:?} should be rejected, got: {all}"
+        );
+    }
+}
+
+#[test]
 fn duplicate_contributions_are_rejected() {
     let all = invalid_messages(
         r#"
