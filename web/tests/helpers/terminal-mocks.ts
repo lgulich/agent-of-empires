@@ -183,7 +183,7 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
 
 export async function seedSettings(
   page: Page,
-  settings: { mobileFontSize?: number; desktopFontSize?: number; autoOpenKeyboard?: boolean },
+  settings: { mobileFontSize?: number; desktopFontSize?: number; autoOpenKeyboard?: boolean; showSidebarFab?: boolean },
 ) {
   await page.evaluate((settings) => {
     localStorage.setItem(

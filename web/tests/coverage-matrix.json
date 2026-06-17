@@ -357,6 +357,17 @@
       "components": ["web/src/components/TerminalSettings.tsx", "web/src/components/TerminalSessionStack.tsx"]
     },
     {
+      "id": "terminal.mobile-sidebar-fab",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/mobile-sidebar-fab.spec.ts", "src/components/__tests__/SidebarFab.test.tsx"],
+      "components": [
+        "web/src/components/SidebarFab.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileMainPane.tsx"
+      ]
+    },
+    {
       "id": "app-shell.topbar-dev-badge",
       "kind": "vitest",
       "risk": "low",
