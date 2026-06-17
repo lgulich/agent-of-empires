@@ -54,6 +54,9 @@ pub fn check_one(record: &LockRecord) -> UpdateStatus {
                 },
             }
         }
+        // Linked plugins read live from their source, so there is nothing to
+        // pull; edits are already in effect on the next reload.
+        PluginSource::Linked { .. } => UpdateStatus::UpToDate,
     }
 }
 

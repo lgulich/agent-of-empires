@@ -182,6 +182,73 @@ default = false
 
 #[test]
 #[serial]
+fn test_link_runs_from_source_and_unlink_keeps_it() {
+    let h = TuiTestHarness::new("plugin_link");
+    let source = tempfile::tempdir().expect("plugin source dir");
+    let manifest = source.path().join("aoe-plugin.toml");
+    std::fs::write(
+        &manifest,
+        r#"
+id = "acme.linkdemo"
+name = "Link Demo"
+version = "0.1.0"
+api_version = 1
+description = "Link e2e fixture."
+"#,
+    )
+    .unwrap();
+    let dir = source.path().to_str().unwrap();
+
+    let link = h.run_cli(&["plugin", "link", dir, "--yes"]);
+    assert!(
+        link.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&link.stdout).contains("Linked acme.linkdemo v0.1.0"),
+        "unexpected link output:\n{}",
+        String::from_utf8_lossy(&link.stdout)
+    );
+
+    // The list marks the source as linked to the live path, not copied.
+    let list = h.run_cli(&["plugin", "list"]);
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        listed.contains("acme.linkdemo") && listed.contains("linked:"),
+        "list must show the linked source:\n{listed}"
+    );
+
+    // uninstall must refuse a linked plugin and point at unlink, so the
+    // copy-removing path never runs against a live source tree.
+    let bad = h.run_cli(&["plugin", "uninstall", "acme.linkdemo"]);
+    assert!(
+        !bad.status.success() && String::from_utf8_lossy(&bad.stderr).contains("unlink"),
+        "uninstall on a linked plugin must fail and mention unlink:\n{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let unlink = h.run_cli(&["plugin", "unlink", "acme.linkdemo"]);
+    assert!(
+        unlink.status.success(),
+        "unlink failed: {}",
+        String::from_utf8_lossy(&unlink.stderr)
+    );
+    // The source tree must survive unlink untouched (no rm-rf through the
+    // recorded path).
+    assert!(
+        manifest.is_file(),
+        "unlink must not delete the source directory"
+    );
+    let gone = h.run_cli(&["plugin", "list"]);
+    assert!(
+        !String::from_utf8_lossy(&gone.stdout).contains("acme.linkdemo"),
+        "unlinked plugin must disappear from the list"
+    );
+}
+
+#[test]
+#[serial]
 fn test_core_setting_default_override_applies_and_explains() {
     let h = TuiTestHarness::new("plugin_core_override");
     let source = tempfile::tempdir().expect("plugin source dir");

@@ -81,6 +81,21 @@ editing your source tree does nothing until you re-stage it:
 aoe plugin update you.my-plugin   # re-copies from the recorded source path
 ```
 
+For active development, link the directory instead of installing it:
+
+```sh
+aoe plugin link ./my-plugin       # runs live from the source, no copy
+aoe plugin unlink you.my-plugin   # drops the link; your files stay put
+```
+
+A linked plugin is read directly from its source on every start, so code
+edits take effect immediately with no re-stage. Editing the manifest changes
+its hash and re-triggers the capability grant (the declared set may have
+changed); editing only code keeps the grant. Linked plugins are never
+featured and may not use a reserved (`aoe.* / agent-of-empires.*`) id.
+`unlink` removes only the link metadata, never your source directory; use
+`uninstall` for copied installs.
+
 The update is detected by tree hash, so any file change counts, not just
 the manifest. For releases, print the hash that pins a version:
 

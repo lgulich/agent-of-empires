@@ -167,15 +167,16 @@ impl PluginRegistry {
         load_errors: &mut Vec<String>,
     ) {
         let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            // No plugins installed yet.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(entries) => Some(entries),
+            // No copied-install directory yet; linked plugins (below) can
+            // still exist, so fall through rather than return.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 load_errors.push(format!("reading {}: {e}", dir.display()));
-                return;
+                None
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries.into_iter().flatten().flatten() {
             let root = entry.path();
             let manifest_path = root.join("aoe-plugin.toml");
             if !manifest_path.is_file() {
@@ -239,6 +240,65 @@ impl PluginRegistry {
                 grant,
                 settings: entry_cfg.map(|p| p.settings.clone()).unwrap_or_default(),
             });
+        }
+
+        // Linked (dev-mode) plugins live outside <app_dir>/plugins; their root
+        // is an external source tree recorded in the lockfile, read live so
+        // edits take effect on reload with no copy step.
+        if let Some(lockfile) = lockfile {
+            for (id, rec) in lockfile.iter() {
+                let PluginSource::Linked { path } = &rec.source else {
+                    continue;
+                };
+                if plugins.iter().any(|p| p.id() == id) {
+                    load_errors.push(format!(
+                        "linked plugin {id:?} shadows another plugin with the same id; skipped"
+                    ));
+                    continue;
+                }
+                let root = std::path::PathBuf::from(path);
+                let manifest_path = root.join("aoe-plugin.toml");
+                let raw = match std::fs::read_to_string(&manifest_path) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        load_errors.push(format!(
+                            "linked {id:?} source unreadable at {}: {e}; run `aoe plugin unlink {id}`",
+                            manifest_path.display()
+                        ));
+                        continue;
+                    }
+                };
+                let manifest = match PluginManifest::from_toml_str(&raw) {
+                    Ok(manifest) => manifest,
+                    Err(e) => {
+                        load_errors.push(format!("{}: {e}", manifest_path.display()));
+                        continue;
+                    }
+                };
+                if let Some(min) = manifest.min_aoe_version.as_deref() {
+                    let host = env!("CARGO_PKG_VERSION");
+                    if !host_meets_min(min, host) {
+                        load_errors.push(format!(
+                            "linked {id:?} requires aoe >= {min} but this build is {host}; skipped"
+                        ));
+                        continue;
+                    }
+                }
+                let hash = manifest_hash(raw.as_bytes());
+                let grant = grant_store
+                    .map(|s| s.status(id, &hash))
+                    .unwrap_or(GrantStatus::Missing);
+                let entry_cfg = config.plugins.get(id);
+                plugins.push(LoadedPlugin {
+                    manifest,
+                    manifest_hash: hash,
+                    root: Some(root),
+                    source: rec.source.clone(),
+                    enabled: entry_cfg.map(|p| p.enabled).unwrap_or(false),
+                    grant,
+                    settings: entry_cfg.map(|p| p.settings.clone()).unwrap_or_default(),
+                });
+            }
         }
     }
 

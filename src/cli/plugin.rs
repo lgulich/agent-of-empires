@@ -32,6 +32,19 @@ pub enum PluginCommands {
         /// Plugin id
         id: String,
     },
+    /// Link a local directory for development: run it live, no copy
+    Link {
+        /// Path to a directory containing aoe-plugin.toml
+        path: String,
+        /// Skip the interactive capability prompt and grant everything declared
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Unlink a development plugin; the source directory is left untouched
+    Unlink {
+        /// Plugin id
+        id: String,
+    },
     /// Enable a plugin's contributions
     Enable {
         /// Plugin id
@@ -67,6 +80,8 @@ pub fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Info { id } => run_info(&id),
         PluginCommands::Install { source, yes } => run_install(&source, yes),
         PluginCommands::Uninstall { id } => run_uninstall(&id),
+        PluginCommands::Link { path, yes } => run_link(&path, yes),
+        PluginCommands::Unlink { id } => run_unlink(&id),
         PluginCommands::Enable { id } => run_set_enabled(&id, true),
         PluginCommands::Disable { id } => run_set_enabled(&id, false),
         PluginCommands::Update { id, yes } => run_update(&id, yes),
@@ -369,6 +384,31 @@ fn run_install(source: &str, yes: bool) -> Result<()> {
 fn run_uninstall(id: &str) -> Result<()> {
     crate::plugin::install::uninstall(id)?;
     println!("Uninstalled {id}. Per-session plugin data was kept.");
+    Ok(())
+}
+
+fn run_link(path: &str, yes: bool) -> Result<()> {
+    let mut confirm = |prompt: &InstallPrompt| {
+        if yes {
+            print_prompt_summary(prompt);
+            true
+        } else {
+            prompt_for_capabilities(prompt)
+        }
+    };
+    match crate::plugin::install::link(path, &mut confirm)? {
+        InstallOutcome::Installed { id, version } => {
+            println!("Linked {id} v{version} from {path} (enabled). Edits apply on next start.");
+        }
+        InstallOutcome::Declined => println!("Aborted; nothing linked."),
+        outcome => unreachable!("link returned {outcome:?}"),
+    }
+    Ok(())
+}
+
+fn run_unlink(id: &str) -> Result<()> {
+    crate::plugin::install::unlink(id)?;
+    println!("Unlinked {id}. The source directory was left in place.");
     Ok(())
 }
 

@@ -44,6 +44,10 @@ pub enum PluginSource {
     GitHub { slug: String },
     /// Installed from a local directory.
     Path { path: String },
+    /// Linked to a local directory for development: the files are read live
+    /// from `path` (never copied), so edits take effect on the next registry
+    /// reload. Removing the link drops only the metadata, never the source.
+    Linked { path: String },
 }
 
 /// Trust levels shown on every management surface and used to word the
@@ -65,7 +69,9 @@ impl PluginSource {
     pub fn trust_level(&self) -> TrustLevel {
         match self {
             PluginSource::Builtin => TrustLevel::Builtin,
-            PluginSource::GitHub { .. } | PluginSource::Path { .. } => TrustLevel::Community,
+            PluginSource::GitHub { .. }
+            | PluginSource::Path { .. }
+            | PluginSource::Linked { .. } => TrustLevel::Community,
         }
     }
 
@@ -76,6 +82,7 @@ impl PluginSource {
             PluginSource::Builtin => "builtin".to_string(),
             PluginSource::GitHub { slug } => format!("github:{slug}"),
             PluginSource::Path { path } => format!("path:{path}"),
+            PluginSource::Linked { path } => format!("linked:{path}"),
         }
     }
 
@@ -88,6 +95,7 @@ impl PluginSource {
             PluginSource::Builtin => "builtin".to_string(),
             PluginSource::GitHub { slug } => format!("github:{slug}"),
             PluginSource::Path { .. } => "path".to_string(),
+            PluginSource::Linked { .. } => "linked".to_string(),
         }
     }
 }
@@ -245,5 +253,14 @@ mod tests {
             "github:owner/repo"
         );
         assert_eq!(PluginSource::Builtin.describe_redacted(), "builtin");
+        // A linked dev path is as private as a copied one: redact to the bare
+        // kind, but show it verbatim on the local-only describe surface.
+        let linked = PluginSource::Linked {
+            path: "/Users/alice/dev/my-plugin".to_string(),
+        };
+        assert_eq!(linked.describe_redacted(), "linked");
+        assert!(!linked.describe_redacted().contains("alice"));
+        assert_eq!(linked.describe(), "linked:/Users/alice/dev/my-plugin");
+        assert_eq!(linked.trust_level(), TrustLevel::Community);
     }
 }

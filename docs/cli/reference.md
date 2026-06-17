@@ -42,6 +42,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin info`↴](#aoe-plugin-info)
 * [`aoe plugin install`↴](#aoe-plugin-install)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin link`↴](#aoe-plugin-link)
+* [`aoe plugin unlink`↴](#aoe-plugin-unlink)
 * [`aoe plugin enable`↴](#aoe-plugin-enable)
 * [`aoe plugin disable`↴](#aoe-plugin-disable)
 * [`aoe plugin update`↴](#aoe-plugin-update)
@@ -665,6 +667,8 @@ Manage plugins (install, enable, disable, update)
 * `info` — Show one plugin's manifest details, capabilities, and grant state
 * `install` — Install a plugin from a GitHub slug (`owner/repo`) or a local directory
 * `uninstall` — Remove an installed plugin (files, grant, config entry)
+* `link` — Link a local directory for development: run it live, no copy
+* `unlink` — Unlink a development plugin; the source directory is left untouched
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `update` — Update an installed plugin from its recorded source
@@ -715,6 +719,34 @@ Install a plugin from a GitHub slug (`owner/repo`) or a local directory
 Remove an installed plugin (files, grant, config entry)
 
 **Usage:** `aoe plugin uninstall <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin link`
+
+Link a local directory for development: run it live, no copy
+
+**Usage:** `aoe plugin link [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — Path to a directory containing aoe-plugin.toml
+
+###### **Options:**
+
+* `--yes` — Skip the interactive capability prompt and grant everything declared
+
+
+
+## `aoe plugin unlink`
+
+Unlink a development plugin; the source directory is left untouched
+
+**Usage:** `aoe plugin unlink <ID>`
 
 ###### **Arguments:**
 

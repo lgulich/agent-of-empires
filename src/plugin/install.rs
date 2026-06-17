@@ -169,6 +169,9 @@ fn stage(source: &PluginSource) -> Result<Staged> {
             (dest, Some(tmp))
         }
         PluginSource::Builtin => bail!("builtin plugins are part of the aoe binary"),
+        PluginSource::Linked { .. } => {
+            bail!("linked plugins run from their source; there is nothing to stage")
+        }
     };
     let manifest_path = root.join("aoe-plugin.toml");
     let manifest_raw = std::fs::read_to_string(&manifest_path)
@@ -335,6 +338,9 @@ pub fn update(
     if record.source == PluginSource::Builtin {
         bail!("{plugin_id} is builtin; it updates with the aoe binary");
     }
+    if matches!(record.source, PluginSource::Linked { .. }) {
+        bail!("{plugin_id} is linked; edit its source in place, no update step is needed");
+    }
 
     let staged = stage(&record.source)?;
     if staged.manifest.id.as_str() != plugin_id {
@@ -474,11 +480,121 @@ pub fn uninstall(plugin_id: &str) -> Result<()> {
         (PluginSource::Builtin, _) => {
             bail!("{plugin_id} is builtin; disable it instead: `aoe plugin disable {plugin_id}`")
         }
+        // A linked plugin's root is the user's live source tree; deleting it
+        // would destroy their work. Route to unlink, which drops only metadata.
+        (PluginSource::Linked { .. }, _) => {
+            bail!("{plugin_id} is linked; remove it with `aoe plugin unlink {plugin_id}`")
+        }
         (_, Some(root)) => root.clone(),
         (_, None) => bail!("{plugin_id} has no install directory on record"),
     };
     let _lock = mutation_lock()?;
     std::fs::remove_dir_all(&root).with_context(|| format!("removing {}", root.display()))?;
+    Lockfile::load()?.remove(plugin_id)?;
+    GrantStore::load()?.revoke(plugin_id)?;
+    let mut config = Config::load()?;
+    config.plugins.remove(plugin_id);
+    save_config(&config)?;
+    super::reload_registry();
+    Ok(())
+}
+
+/// Link a local plugin directory for development: read it live from `path`
+/// without copying, so source edits take effect on the next registry reload.
+/// The capability prompt fires exactly as for a normal install; linked
+/// plugins are never featured, so a reserved namespace is rejected. Returns
+/// [`InstallOutcome::Declined`] if `confirm` returns false.
+pub fn link(path: &str, confirm: &mut dyn FnMut(&InstallPrompt) -> bool) -> Result<InstallOutcome> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        bail!("{path:?} is not a directory");
+    }
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("resolving {path}"))?;
+    let manifest_raw = std::fs::read_to_string(root.join("aoe-plugin.toml"))
+        .with_context(|| format!("no aoe-plugin.toml at {}", root.display()))?;
+    let manifest = PluginManifest::from_toml_str(&manifest_raw)?;
+    let id = manifest.id.as_str().to_string();
+    let source = PluginSource::Linked {
+        path: root.display().to_string(),
+    };
+
+    if let Some(existing) = super::registry().get(&id) {
+        match existing.source {
+            PluginSource::Builtin => bail!("{id} is a builtin plugin and already bundled"),
+            _ => bail!("{id} is already installed; uninstall or unlink it first"),
+        }
+    }
+    if manifest.id.is_reserved_namespace() {
+        bail!(
+            "plugin id {id:?} uses a reserved namespace (aoe.* / agent-of-empires.*); \
+             linked plugins are never first-party"
+        );
+    }
+
+    let hash = manifest_hash(manifest_raw.as_bytes());
+    let prompt = InstallPrompt {
+        id: id.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        description: manifest.description.clone(),
+        capabilities: manifest.capabilities.clone(),
+        trust: source.trust_level(),
+        source: source.clone(),
+        previous_capabilities: None,
+        featured: FeaturedValidation::NotFeatured,
+        manifest_hash: hash.clone(),
+        core_default_overrides: super::core_overrides::declared_core_overrides(&manifest),
+    };
+    if !confirm(&prompt) {
+        return Ok(InstallOutcome::Declined);
+    }
+
+    let _lock = mutation_lock()?;
+    if super::registry().get(&id).is_some() {
+        bail!("{id} is already installed; uninstall or unlink it first");
+    }
+    // No tree to copy; write only the metadata that marks the link. A partial
+    // write rolls back grant + lockfile so a failed link leaves no orphan.
+    let metadata = (|| -> Result<()> {
+        GrantStore::load()?.grant(&id, hash.clone(), manifest.capabilities.clone())?;
+        Lockfile::load()?.upsert(
+            &id,
+            LockRecord {
+                version: manifest.version.clone(),
+                source,
+                manifest_hash: hash,
+                tree_hash: super::integrity::tree_hash(&root)?,
+                commit: None,
+                installed_at: Utc::now(),
+            },
+        )?;
+        enable_in_config(&id, true)
+    })();
+    if let Err(e) = metadata {
+        GrantStore::load().and_then(|mut g| g.revoke(&id)).ok();
+        Lockfile::load().and_then(|mut l| l.remove(&id)).ok();
+        return Err(e);
+    }
+    super::reload_registry();
+    Ok(InstallOutcome::Installed {
+        id,
+        version: manifest.version,
+    })
+}
+
+/// Remove a linked plugin: drop its lockfile entry, grant, and config entry.
+/// The source directory is never touched (that is the user's working tree).
+pub fn unlink(plugin_id: &str) -> Result<()> {
+    let registry = super::registry();
+    let plugin = registry
+        .get(plugin_id)
+        .ok_or_else(|| anyhow!("{plugin_id} is not linked"))?;
+    if !matches!(plugin.source, PluginSource::Linked { .. }) {
+        bail!("{plugin_id} is not linked; remove it with `aoe plugin uninstall {plugin_id}`");
+    }
+    let _lock = mutation_lock()?;
     Lockfile::load()?.remove(plugin_id)?;
     GrantStore::load()?.revoke(plugin_id)?;
     let mut config = Config::load()?;

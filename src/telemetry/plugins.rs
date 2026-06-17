@@ -42,7 +42,7 @@ pub fn plugin_adoption() -> PluginAdoption {
 fn adoption_from(
     plugins: impl Iterator<Item = (String, PluginSource, bool, bool)>,
 ) -> PluginAdoption {
-    let mut by_source: BTreeMap<String, u32> = ["builtin", "github", "path"]
+    let mut by_source: BTreeMap<String, u32> = ["builtin", "github", "path", "linked"]
         .into_iter()
         .map(|k| (k.to_string(), 0))
         .collect();
@@ -55,6 +55,9 @@ fn adoption_from(
             // manifest id stay off the wire.
             PluginSource::GitHub { .. } => ("github", featured),
             PluginSource::Path { .. } => ("path", false),
+            // Dev-mode link to a local source tree; never allowlisted (the
+            // path can be private and the plugin is unreleased).
+            PluginSource::Linked { .. } => ("linked", false),
         };
         *by_source.get_mut(key).expect("pre-seeded source key") += 1;
         if allowlisted {

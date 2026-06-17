@@ -123,4 +123,33 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn lockfile_round_trips_linked_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.lock");
+        let mut lock = Lockfile::load_from(path.clone()).unwrap();
+        lock.upsert(
+            "acme.dev",
+            LockRecord {
+                version: "0.1.0".into(),
+                source: PluginSource::Linked {
+                    path: "/home/dev/acme".into(),
+                },
+                manifest_hash: "sha256:abc".into(),
+                tree_hash: "sha256:def".into(),
+                commit: None,
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let reloaded = Lockfile::load_from(path).unwrap();
+        assert_eq!(
+            reloaded.get("acme.dev").unwrap().source,
+            PluginSource::Linked {
+                path: "/home/dev/acme".into()
+            }
+        );
+    }
 }
