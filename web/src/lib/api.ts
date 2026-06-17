@@ -187,6 +187,22 @@ export interface PluginLinkHandler {
   rpc_method: string;
 }
 
+/** A declared plugin terminal pane (the open-pane affordance). */
+export interface PluginPaneDecl {
+  id: string;
+  title: string;
+}
+
+/** An open plugin pane returned by the open/list endpoints. */
+export interface PluginPaneHandle {
+  handle: string;
+  plugin_id: string;
+  pane_id: string;
+  session_id: string | null;
+  title: string;
+  ws_path: string;
+}
+
 export interface PluginInfo {
   id: string;
   name: string;
@@ -202,6 +218,7 @@ export interface PluginInfo {
   setting_count: number;
   builtin: boolean;
   link_handlers: PluginLinkHandler[];
+  panes: PluginPaneDecl[];
 }
 
 export interface PluginListResponse {
@@ -348,6 +365,39 @@ export async function postLinkAction(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rpc_method, text, session_id: sessionId }),
     });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Open (or refocus) a plugin terminal pane for the focused session. Returns
+ *  the open handle (with its ws path) or null on failure. */
+export async function openPluginPane(
+  pluginId: string,
+  paneId: string,
+  sessionId: string | null,
+): Promise<PluginPaneHandle | null> {
+  return fetchJson<PluginPaneHandle>(
+    `/api/plugins/${encodeURIComponent(pluginId)}/panes/${encodeURIComponent(paneId)}/open`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    },
+  );
+}
+
+/** Every currently-open plugin pane, so a refreshed dashboard re-discovers them. */
+export async function listPluginPanes(): Promise<PluginPaneHandle[]> {
+  const res = await fetchJson<{ panes: PluginPaneHandle[] }>("/api/plugins/panes");
+  return res?.panes ?? [];
+}
+
+/** Close a plugin pane (kills its tmux session). Returns true on a 2xx. */
+export async function closePluginPane(handle: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugin-panes/${encodeURIComponent(handle)}`, { method: "DELETE" });
     return res.ok;
   } catch {
     return false;

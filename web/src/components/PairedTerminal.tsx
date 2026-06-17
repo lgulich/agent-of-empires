@@ -3,7 +3,14 @@ import { useTerminal } from "../hooks/useTerminal";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { LiveTerminalView } from "./LiveTerminalView";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import { ensureTerminal } from "../lib/api";
+import {
+  closePluginPane,
+  ensureTerminal,
+  fetchPlugins,
+  listPluginPanes,
+  openPluginPane,
+  type PluginPaneHandle,
+} from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -138,54 +145,194 @@ function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMod
   );
 }
 
+/** A plugin-owned terminal pane: the host already spawned its tmux session at
+ *  open time, so this attaches the xterm relay directly to the absolute
+ *  /api/plugin-panes/{handle}/ws path (no ensureTerminal boot step). */
+function PluginPaneTerminal({ handle }: { handle: string }) {
+  const { containerRef, state, manualReconnect, activate, maxRetries } = useTerminal(
+    handle,
+    `/api/plugin-panes/${handle}/ws`,
+    false,
+  );
+  return (
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+      <TerminalConnectionBanners
+        connected={state.connected}
+        reconnecting={state.reconnecting}
+        retryCount={state.retryCount}
+        retryCountdown={state.retryCountdown}
+        maxRetries={maxRetries}
+        onRetry={manualReconnect}
+      />
+      <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative term-panel">
+        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
+      </div>
+    </div>
+  );
+}
+
+/** A declared pane the user can open, with the owning plugin id. */
+interface DeclaredPane {
+  pluginId: string;
+  paneId: string;
+  title: string;
+}
+
 /** Host/container shell switch plus the paired terminal. Used both in the
  *  desktop right-panel split (`fullViewport={false}`) and as the promoted
- *  single full-viewport mobile pane (`fullViewport`). */
+ *  single full-viewport mobile pane (`fullViewport`). Plugin-owned panes
+ *  (#268) appear as extra tabs alongside the shell. */
 export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
+  // `null` means a shell tab (host/container) is active; otherwise the active
+  // plugin pane handle.
+  const [activePane, setActivePane] = useState<string | null>(null);
+  const [declared, setDeclared] = useState<DeclaredPane[]>([]);
+  const [openPanes, setOpenPanes] = useState<PluginPaneHandle[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
   const isSandboxed = session?.is_sandboxed ?? false;
   // Touch devices get the capture-snapshot live view (same architecture
   // as the agent pane); fine pointers keep the xterm PTY relay.
   const coarse = useIsCoarsePointer();
+
+  // Declared panes come from the active plugin set (global).
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPlugins().then((list) => {
+      if (cancelled || !list) return;
+      const decls = list.plugins
+        .filter((p) => p.active)
+        .flatMap((p) => (p.panes ?? []).map((pane) => ({ pluginId: p.id, paneId: pane.id, title: pane.title })));
+      setDeclared(decls);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Reset pane state during render when the session changes (the effect-key
+  // pattern PairedTerminal uses; avoids set-state-in-effect).
+  const [trackedSession, setTrackedSession] = useState(sessionId);
+  if (sessionId !== trackedSession) {
+    setTrackedSession(sessionId);
+    setActivePane(null);
+    setOpenPanes([]);
+  }
+
+  // Open panes are session-scoped; re-discover them when the session changes
+  // so a dashboard refresh or a session switch re-attaches the right ones.
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    void listPluginPanes().then((panes) => {
+      if (cancelled) return;
+      setOpenPanes(panes.filter((p) => p.session_id === sessionId));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  const handleOpen = useCallback(
+    async (decl: DeclaredPane) => {
+      setMenuOpen(false);
+      const opened = await openPluginPane(decl.pluginId, decl.paneId, sessionId);
+      if (!opened) return;
+      setOpenPanes((prev) => (prev.some((p) => p.handle === opened.handle) ? prev : [...prev, opened]));
+      setActivePane(opened.handle);
+    },
+    [sessionId],
+  );
+
+  const handleClose = useCallback(async (handle: string) => {
+    await closePluginPane(handle);
+    setOpenPanes((prev) => prev.filter((p) => p.handle !== handle));
+    setActivePane((cur) => (cur === handle ? null : cur));
+  }, []);
+
+  const shellTabClass = (active: boolean) =>
+    `text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
+      active ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
+    }`;
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex items-center gap-1 px-2 py-1 bg-surface-900 border-b border-surface-700/20 shrink-0">
         <span className="text-xs text-text-dim mr-1">Shell</span>
         <button
-          onClick={() => setShellMode("host")}
-          className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-            shellMode === "host" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
-          }`}
+          onClick={() => {
+            setShellMode("host");
+            setActivePane(null);
+          }}
+          className={shellTabClass(activePane === null && shellMode === "host")}
         >
           Host
         </button>
         {isSandboxed && (
           <button
-            onClick={() => setShellMode("container")}
-            className={`text-[12px] px-2 py-0.5 rounded cursor-pointer transition-colors ${
-              shellMode === "container" ? "text-brand-500 bg-brand-600/10" : "text-text-dim hover:text-text-muted"
-            }`}
+            onClick={() => {
+              setShellMode("container");
+              setActivePane(null);
+            }}
+            className={shellTabClass(activePane === null && shellMode === "container")}
           >
             Container
           </button>
         )}
+        {openPanes.map((p) => (
+          <span key={p.handle} className={shellTabClass(activePane === p.handle)}>
+            <button onClick={() => setActivePane(p.handle)} className="cursor-pointer">
+              {p.title}
+            </button>
+            <button
+              onClick={() => void handleClose(p.handle)}
+              aria-label={`Close ${p.title}`}
+              className="ml-1 cursor-pointer text-text-dim hover:text-status-error"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        {declared.length > 0 && (
+          <div className="relative ml-auto">
+            <button
+              onClick={() => setMenuOpen((o) => !o)}
+              aria-label="Open plugin pane"
+              className="text-[12px] px-2 py-0.5 rounded cursor-pointer text-text-dim hover:text-text-muted"
+            >
+              + Pane
+            </button>
+            {menuOpen && (
+              <div className="absolute right-0 z-10 mt-1 min-w-40 rounded border border-surface-700/60 bg-surface-900 py-1 shadow-lg">
+                {declared.map((d) => (
+                  <button
+                    key={`${d.pluginId}:${d.paneId}`}
+                    onClick={() => void handleOpen(d)}
+                    className="block w-full px-3 py-1 text-left text-[12px] text-text-muted hover:bg-brand-600/10 hover:text-brand-500 cursor-pointer"
+                  >
+                    {d.title}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
-      {sessionId ? (
-        coarse && session ? (
-          <LiveTerminalView
-            key={`${sessionId}-${shellMode}`}
-            session={session}
-            surface={shellMode === "container" ? "paired-container" : "paired-host"}
-          />
-        ) : (
-          <PairedTerminal key={`${sessionId}-${shellMode}`} sessionId={sessionId} mode={shellMode} />
-        )
-      ) : (
+      {!sessionId ? (
         <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
           <p className="text-xs">Select a session</p>
         </div>
+      ) : activePane ? (
+        <PluginPaneTerminal key={activePane} handle={activePane} />
+      ) : coarse && session ? (
+        <LiveTerminalView
+          key={`${sessionId}-${shellMode}`}
+          session={session}
+          surface={shellMode === "container" ? "paired-container" : "paired-host"}
+        />
+      ) : (
+        <PairedTerminal key={`${sessionId}-${shellMode}`} sessionId={sessionId} mode={shellMode} />
       )}
     </div>
   );

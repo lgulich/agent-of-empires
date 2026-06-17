@@ -621,7 +621,11 @@ export function useTerminal(
       // the URL query string. URLs land in access logs (axum, cloudflared,
       // Tailscale, any reverse proxy); subprotocol headers don't.
       const token = getToken();
-      const url = `${proto}//${location.host}/sessions/${sessionId}/${wsPath}`;
+      // A leading-slash `wsPath` is an absolute relay path (plugin panes live
+      // at /api/plugin-panes/{handle}/ws, outside /sessions); otherwise it is
+      // a suffix under the session's relay.
+      const relay = wsPath.startsWith("/") ? wsPath : `/sessions/${sessionId}/${wsPath}`;
+      const url = `${proto}//${location.host}${relay}`;
       tdbg("connect()", {
         sessionId,
         wsPath,

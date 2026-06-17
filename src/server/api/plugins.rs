@@ -373,15 +373,21 @@ pub async fn open_plugin_pane(
             .map(|i| i.project_path.clone()),
         None => None,
     };
+    let session_id = body.session_id.clone();
     let ctx = plugin::panes::PaneContext {
-        session_id: body.session_id.clone(),
+        session_id: session_id.clone(),
         worktree,
     };
+    let plugin_id = id.clone();
+    let pane = pane_id.clone();
     let result =
         tokio::task::spawn_blocking(move || plugin::panes::open(&id, &pane_id, &ctx)).await;
     match result {
         Ok(Ok(opened)) => Json(json!({
             "handle": opened.handle,
+            "plugin_id": plugin_id,
+            "pane_id": pane,
+            "session_id": session_id,
             "title": opened.title,
             "ws_path": format!("/api/plugin-panes/{}/ws", opened.handle),
         }))

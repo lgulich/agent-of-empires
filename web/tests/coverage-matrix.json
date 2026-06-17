@@ -10,6 +10,13 @@
       "components": ["web/src/components/XtermTerminalView.tsx"]
     },
     {
+      "id": "terminal.plugin-panes",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/pluginPanesApi.test.ts"],
+      "components": ["web/src/components/PairedTerminal.tsx"]
+    },
+    {
       "id": "settings.mcp-servers",
       "kind": "live-playwright",
       "risk": "high",
