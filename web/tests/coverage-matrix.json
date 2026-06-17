@@ -360,11 +360,16 @@
       "id": "terminal.mobile-sidebar-fab",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/mobile-sidebar-fab.spec.ts", "src/components/__tests__/SidebarFab.test.tsx"],
+      "specs": [
+        "tests/mobile-sidebar-fab.spec.ts",
+        "src/components/__tests__/SidebarFab.test.tsx",
+        "src/components/__tests__/PairedTerminal.test.tsx"
+      ],
       "components": [
         "web/src/components/SidebarFab.tsx",
         "web/src/components/LiveTerminalView.tsx",
-        "web/src/components/MobileMainPane.tsx"
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/PairedTerminal.tsx"
       ]
     },
     {

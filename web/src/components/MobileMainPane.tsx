@@ -131,7 +131,12 @@ export function MobileMainPane({
 
         {pairedMounted && (
           <div className={layerClass(view === "paired")} inert={view !== "paired"}>
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} />
+            <PairedShellPane
+              session={activeSession}
+              sessionId={activeSessionId}
+              sidebarOpen={sidebarOpen}
+              onToggleSidebar={onToggleSidebar}
+            />
           </div>
         )}
 

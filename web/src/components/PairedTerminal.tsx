@@ -8,7 +8,17 @@ type ShellMode = "host" | "container";
  *  desktop right-panel split and as the promoted single full-viewport mobile
  *  pane. Renders the capture-snapshot live view on every device (same
  *  architecture as the agent pane); the xterm.js PTY relay was removed. */
-export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
+export function PairedShellPane({
+  session,
+  sessionId,
+  sidebarOpen,
+  onToggleSidebar,
+}: {
+  session: SessionResponse | null;
+  sessionId: string | null;
+  sidebarOpen?: boolean;
+  onToggleSidebar?: () => void;
+}) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
 
@@ -41,6 +51,8 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
           key={`${sessionId}-${shellMode}`}
           session={session}
           surface={shellMode === "container" ? "paired-container" : "paired-host"}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={onToggleSidebar}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
