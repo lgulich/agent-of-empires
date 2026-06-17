@@ -247,7 +247,7 @@ mod serve {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(12);
+    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(45);
 
     /// Marks a session as having an in-flight one-shot rename so a burst of
     /// rapid first prompts cannot spawn concurrent title generators. Removed on
@@ -326,9 +326,22 @@ mod serve {
             return;
         };
 
-        // One attempt per session lifetime. A failed or unusable first try
-        // leaves the name default; without this guard every later prompt would
-        // respawn a one-shot agent (12s + tokens) until one happened to succeed.
+        let prompt = build_prompt(&first_message);
+        let Some(argv) = build_oneshot_argv(agent, &prompt) else {
+            return;
+        };
+
+        // A spawn error, timeout, or non-zero exit returns None. Do NOT mark the
+        // session attempted in that case: a transient slow first prompt (cold
+        // agent start) must not permanently disable naming. A later prompt
+        // retries. The inflight guard above already prevents concurrent spawns.
+        let Some(raw) = run_oneshot(&argv, &project_path).await else {
+            return;
+        };
+
+        // The agent produced output (usable or not). Mark attempted now, once per
+        // session lifetime: an answer the sanitizer rejects is not worth respawning
+        // a one-shot agent (tokens) for on every later prompt.
         {
             let mut attempted = state
                 .smart_rename_attempted
@@ -338,15 +351,6 @@ mod serve {
                 return;
             }
         }
-
-        let prompt = build_prompt(&first_message);
-        let Some(argv) = build_oneshot_argv(agent, &prompt) else {
-            return;
-        };
-
-        let Some(raw) = run_oneshot(&argv, &project_path).await else {
-            return;
-        };
         let Some(new_title) = sanitize_title(&raw, &first_message) else {
             tracing::debug!(target: "smart_rename", session = %session_id, "skip: agent output not a usable title");
             return;
@@ -441,6 +445,24 @@ mod serve {
                 tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "renamed session from first message");
                 inst.title = new_title.to_string();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn run_oneshot_returns_none_on_spawn_failure() {
+            // A failed spawn must surface as None so try_smart_rename leaves the
+            // session un-attempted and a later prompt can retry. A binary that
+            // does not exist is the deterministic, machine-independent failure.
+            let argv = vec![
+                "aoe-smart-rename-nonexistent-binary-xyz".to_string(),
+                "-p".to_string(),
+                "title this".to_string(),
+            ];
+            assert!(run_oneshot(&argv, "").await.is_none());
         }
     }
 }
