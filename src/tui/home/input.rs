@@ -755,12 +755,18 @@ impl HomeView {
             "text": m.text,
             "session_id": self.selected_session.clone(),
         });
-        if let Err(e) = crate::plugin::runtime::invoke_action(&m.plugin_id, &m.rpc_method, params) {
-            self.info_dialog = Some(InfoDialog::new(
-                &format!("Plugin link: {}", m.rpc_method),
-                &format!("{e:#}"),
-            ));
-        }
+        // Dispatch on a detached thread so a slow or hung plugin worker can
+        // never block the TUI event loop (the host call waits up to its
+        // CALL_TIMEOUT). The plugin surfaces results through host UI state and
+        // notifications; a failure is logged rather than shown as a modal that
+        // would pop seconds after the click.
+        let plugin_id = m.plugin_id.clone();
+        let rpc_method = m.rpc_method.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::plugin::runtime::invoke_action(&plugin_id, &rpc_method, params) {
+                tracing::warn!(target: "plugin", plugin = %plugin_id, method = %rpc_method, "plugin link action failed: {e:#}");
+            }
+        });
         true
     }
 
@@ -2210,19 +2216,18 @@ impl HomeView {
             bindings::resolve_plugin(&key, self.strict_hotkeys, &bindings::plugin_bindings())
         {
             let params = serde_json::json!({ "session_id": self.selected_session.clone() });
-            match crate::plugin::runtime::invoke_action(
-                &binding.plugin_id,
-                &binding.rpc_method,
-                params,
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        &format!("Plugin action: {}", binding.label),
-                        &format!("{e:#}"),
-                    ));
+            // Dispatch on a detached thread so a slow or hung plugin worker can
+            // never freeze the TUI event loop; failures are logged.
+            let plugin_id = binding.plugin_id.clone();
+            let rpc_method = binding.rpc_method.clone();
+            let label = binding.label.clone();
+            std::thread::spawn(move || {
+                if let Err(e) =
+                    crate::plugin::runtime::invoke_action(&plugin_id, &rpc_method, params)
+                {
+                    tracing::warn!(target: "plugin", plugin = %plugin_id, method = %rpc_method, action = %label, "plugin keybind action failed: {e:#}");
                 }
-            }
+            });
             return None;
         }
 

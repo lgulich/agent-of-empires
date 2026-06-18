@@ -124,6 +124,14 @@ pub enum ValidationKind {
     OneOf {
         options: Vec<String>,
     },
+    /// Value must be a JSON boolean. Plugin `Toggle` widgets map here so a web
+    /// PATCH cannot write a string/number/object into a bool setting (plugin
+    /// settings live in an untyped `toml::Table`, so there is no typed-field
+    /// backstop the way core booleans have).
+    Bool,
+    /// Value must be a JSON string (any content). Plugin `Text` widgets map
+    /// here so a web PATCH cannot write a non-string into a text setting.
+    Str,
     /// Non-empty after trimming.
     NonEmptyString,
     /// Docker memory-limit grammar (`512m`, `2g`, ...). Empty allowed.

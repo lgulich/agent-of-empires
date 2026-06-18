@@ -242,6 +242,28 @@ static REVISION: AtomicU64 = AtomicU64::new(0);
 static NOTIFICATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn revision() -> u64 {
+    // Sweep TTL-expired state here, not only on writes: the web poller and the
+    // TUI tick gate refetch/redraw on this revision, so an entry that simply
+    // expires with no later push must still move it, or its badge/card would
+    // linger on screen until an unrelated plugin write. Bump only when the
+    // sweep actually drops something, so a steady state stays cheap.
+    let removed_any = {
+        let mut guard = STORE.write_safe();
+        match guard.as_mut() {
+            Some(store) => {
+                let before = store.state.len();
+                let now = Instant::now();
+                store
+                    .state
+                    .retain(|_, value| value.expires_at.map(|at| at > now).unwrap_or(true));
+                before != store.state.len()
+            }
+            None => false,
+        }
+    };
+    if removed_any {
+        REVISION.fetch_add(1, Ordering::Relaxed);
+    }
     REVISION.load(Ordering::Relaxed)
 }
 

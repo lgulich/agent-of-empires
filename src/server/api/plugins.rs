@@ -363,14 +363,20 @@ pub async fn open_plugin_pane(
     if let Err(resp) = mutation_gate(&state, session.as_deref()).await {
         return resp;
     }
+    // A provided session_id must name a real instance: the pane handle hashes
+    // the session id, so accepting a fabricated one would let a client mint a
+    // fresh detached tmux session per made-up id, defeating the dedup.
     let worktree = match body.session_id.as_deref() {
-        Some(sid) => state
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|i| i.id == sid)
-            .map(|i| i.project_path.clone()),
+        Some(sid) => match state.instances.read().await.iter().find(|i| i.id == sid) {
+            Some(i) => Some(i.project_path.clone()),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "session_not_found",
+                    format!("No session {sid}"),
+                )
+            }
+        },
         None => None,
     };
     let session_id = body.session_id.clone();

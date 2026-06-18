@@ -455,7 +455,10 @@ fn reap_worker(worker: &Worker) {
     // Let the forwarder thread (if any) observe death on its next event and
     // exit, and allow a respawned worker to subscribe again.
     worker.has_forwarder.store(false, Ordering::SeqCst);
-    if let Ok(mut child) = worker.child.lock() {
+    {
+        // Non-poisoning lock, like every other lock in the host: a panic
+        // elsewhere must not strand this kill+wait and leak the child process.
+        let mut child = worker.child.lock_safe();
         let _ = child.kill();
         let _ = child.wait();
     }

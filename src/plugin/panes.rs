@@ -46,6 +46,12 @@ pub struct OpenedPane {
 
 static OPEN_PANES: Mutex<Option<HashMap<String, OpenPane>>> = Mutex::new(None);
 
+/// Safety ceiling on concurrently-open plugin panes across all plugins and
+/// sessions. The (plugin, pane, session) dedup already collapses repeat opens;
+/// this backstops a client that asks to open many distinct panes from spawning
+/// unbounded detached tmux sessions.
+const MAX_OPEN_PANES: usize = 64;
+
 fn with_registry<R>(f: impl FnOnce(&mut HashMap<String, OpenPane>) -> R) -> R {
     let mut guard = OPEN_PANES.lock_safe();
     f(guard.get_or_insert_with(HashMap::new))
@@ -108,6 +114,13 @@ pub fn open(plugin_id: &str, pane_id: &str, ctx: &PaneContext) -> Result<OpenedP
             handle: name,
             title,
         });
+    }
+
+    // Backstop runaway pane creation. The dedup above means this only counts
+    // distinct (plugin, pane, session) tuples; a refocus never reaches here.
+    let live = with_registry(|reg| reg.len());
+    if live >= MAX_OPEN_PANES {
+        bail!("too many plugin panes open ({live}); close some before opening more");
     }
 
     let env = [

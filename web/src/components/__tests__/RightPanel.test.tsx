@@ -14,6 +14,12 @@ const ensureTerminal = vi.fn();
 vi.mock("../../lib/api", () => ({
   ensureSession: vi.fn(),
   ensureTerminal: (id: string, container: boolean) => ensureTerminal(id, container),
+  // PairedShellPane discovers declared/open plugin panes (#268); stub them so
+  // the effects no-op in this terminal-rendering contract test.
+  fetchPlugins: vi.fn(() => Promise.resolve(null)),
+  listPluginPanes: vi.fn(() => Promise.resolve([])),
+  openPluginPane: vi.fn(() => Promise.resolve(null)),
+  closePluginPane: vi.fn(() => Promise.resolve(true)),
 }));
 
 vi.mock("../../hooks/useTerminal", () => ({

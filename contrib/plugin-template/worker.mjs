@@ -83,7 +83,10 @@ rl.on("line", (line) => {
         writeLine({
           jsonrpc: "2.0",
           id: msg.id,
-          error: { code: -32601, message: String(e.message ?? e) },
+          // -32603 (Internal error): the method exists but threw. (-32601 is
+          // "method not found"; the host reads only error.message, but copy
+          // the honest code so plugin authors learn the right convention.)
+          error: { code: -32603, message: String(e.message ?? e) },
         }),
       );
   } else if (msg.id !== undefined) {

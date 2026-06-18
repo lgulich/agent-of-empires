@@ -183,7 +183,8 @@ fn validation_for(widget: &SettingWidget) -> ValidationKind {
         SettingWidget::Select { options } => ValidationKind::OneOf {
             options: options.clone(),
         },
-        SettingWidget::Toggle | SettingWidget::Text => ValidationKind::None,
+        SettingWidget::Toggle => ValidationKind::Bool,
+        SettingWidget::Text => ValidationKind::Str,
         // Unknown future widget: no server-side value rule (#[non_exhaustive]).
         _ => ValidationKind::None,
     }
@@ -449,7 +450,8 @@ mod tests {
                 options: vec!["a".into(), "b".into()]
             }
         );
-        assert_eq!(validation_for(&SettingWidget::Toggle), ValidationKind::None);
+        assert_eq!(validation_for(&SettingWidget::Toggle), ValidationKind::Bool);
+        assert_eq!(validation_for(&SettingWidget::Text), ValidationKind::Str);
     }
 
     #[test]

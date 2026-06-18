@@ -324,11 +324,13 @@ pub struct ThemeContribution {
 /// in-core (Tier 0) or a batched RPC to the plugin worker (Tier 1).
 //
 // No deny_unknown_fields here: serde cannot combine it with #[serde(flatten)]
-// on `mode`. CAVEAT for plugin authors: because of that, a typo in a top-level
-// `[[status_detection]]` key (e.g. `agnet` for `agent`) is SILENTLY DROPPED
-// rather than rejected, and you then hit a confusing downstream error. Verify
-// a status_detection block with `aoe plugin info <id>` after editing. Keys
-// inside `[[status_detection.rules]]` are safe: DetectionRule keeps
+// on `mode`. CAVEAT for plugin authors: because of that, an unknown or
+// misspelled OPTIONAL top-level `[[status_detection]]` key (e.g. a stray
+// `note = "..."`) is SILENTLY DROPPED rather than rejected. A misspelled
+// REQUIRED field still fails loudly (`agnet` instead of `agent` yields
+// "missing field `agent`"). Verify a status_detection block with
+// `aoe plugin info <id>` after editing. Keys inside
+// `[[status_detection.rules]]` are safe: DetectionRule keeps
 // deny_unknown_fields, so a rule typo still fails loudly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -643,6 +645,15 @@ impl PluginManifest {
                     "runtime.entrypoint {:?} must be a relative path inside the plugin (no leading \"/\", drive prefix, or \"..\")",
                     runtime.entrypoint
                 ),
+            );
+            // runtime.args are appended to the worker argv at spawn; reject
+            // empty or NUL-bearing args, like pane command argv.
+            check(
+                runtime
+                    .args
+                    .iter()
+                    .all(|arg| !arg.is_empty() && !arg.contains('\0')),
+                "runtime.args must not contain empty or NUL arguments".into(),
             );
         }
 

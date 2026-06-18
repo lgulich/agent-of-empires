@@ -260,7 +260,7 @@ Sized to what the first three plugins (status detection, attention sort, triage)
 | `agent-hooks` | contribute agent hook install/uninstall declarations |
 | `cli-top-level` | place a CLI command at the top level of the tree |
 
-Tier 0 contributions (settings, keybinds, themes, declarative rules) are implicit and need no runtime capability. A future "security plugin" that gates other plugins' capability use is out of scope for v1; the manifest reserves a `gates` field name for it.
+Tier 0 contributions (settings, keybinds, themes, declarative rules) are implicit and need no runtime capability. A future "security plugin" that gates other plugins' capability use is out of scope for v1 (the manifest is `deny_unknown_fields`, so any such field would arrive as a deliberate, versioned schema change rather than being reserved up front).
 
 ## D9. UI extension points: declared slots, pushed state, host rendering
 

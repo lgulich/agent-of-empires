@@ -16,6 +16,7 @@ pub struct PluginId(String);
 /// Rejection reason for a malformed plugin id.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid plugin id {id:?}: {reason}")]
+#[non_exhaustive]
 pub struct InvalidPluginId {
     pub id: String,
     pub reason: &'static str,

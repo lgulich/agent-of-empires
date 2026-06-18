@@ -35,6 +35,14 @@ impl std::fmt::Display for ValidationError {
 pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), ValidationError> {
     match kind {
         ValidationKind::None => Ok(()),
+        ValidationKind::Bool => value
+            .as_bool()
+            .map(|_| ())
+            .ok_or_else(|| ValidationError::new("expected a boolean")),
+        ValidationKind::Str => value
+            .as_str()
+            .map(|_| ())
+            .ok_or_else(|| ValidationError::new("expected a string")),
         ValidationKind::RangeU64 { min, max } => {
             let n = value
                 .as_u64()
@@ -165,6 +173,17 @@ mod tests {
         assert!(validate_value(&kind, &json!("red")).is_ok());
         assert!(validate_value(&kind, &json!("blue")).is_err());
         assert!(validate_value(&kind, &json!(1)).is_err());
+    }
+
+    #[test]
+    fn bool_and_str_reject_wrong_types() {
+        assert!(validate_value(&ValidationKind::Bool, &json!(true)).is_ok());
+        assert!(validate_value(&ValidationKind::Bool, &json!("true")).is_err());
+        assert!(validate_value(&ValidationKind::Bool, &json!(1)).is_err());
+        assert!(validate_value(&ValidationKind::Str, &json!("")).is_ok());
+        assert!(validate_value(&ValidationKind::Str, &json!("hi")).is_ok());
+        assert!(validate_value(&ValidationKind::Str, &json!(true)).is_err());
+        assert!(validate_value(&ValidationKind::Str, &json!(["x"])).is_err());
     }
 
     #[test]
