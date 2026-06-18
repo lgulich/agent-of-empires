@@ -466,10 +466,6 @@ impl App {
 
         let result = f();
 
-        // Recreate the event stream with a fresh reader before re-entering
-        // the event loop.
-        self.event_stream = Some(EventStream::new());
-
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
@@ -484,7 +480,12 @@ impl App {
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
-        terminal.clear()?;
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen. The stream is
+        // recreated after raw mode and the alternate screen are restored so it is
+        // born into raw mode rather than attached to a briefly-cooked tty.
+        self.event_stream = Some(EventStream::new());
+        crate::tui::clear_terminal(terminal)?;
 
         Ok(result)
     }
@@ -539,7 +540,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Initial render
-        terminal.clear()?;
+        crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.
@@ -679,7 +680,7 @@ impl App {
             // with_raw_mode_disabled drops and recreates the EventStream, so
             // there are no stale events to drain.
             if self.needs_redraw {
-                terminal.clear()?;
+                crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
             }
 
@@ -1204,13 +1205,19 @@ impl App {
             // and the pointer sits at the edge.
             //
             // Request a normal (diffed) redraw via `refresh_needed`, NOT
-            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // `needs_redraw`: the latter forces a `clear_terminal` at the
             // top of the loop, and clearing every ticker frame while the
             // scroll runs strobes the screen blank-then-repaint. The diffed
             // draw at the bottom of the loop repaints smoothly.
             if self.home.tick_preview_autoscroll() {
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            // Dwell-to-read: a session kept selected (list in the foreground)
+            // for a few seconds counts as read and clears its unread marker.
+            if self.home.tick_unread_dwell(std::time::Instant::now()) {
+                refresh_needed = true;
             }
 
             // Update-check / install-status polls can flip the
@@ -1290,6 +1297,11 @@ impl App {
             }
 
             if self.home.apply_recovery_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_restart_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1511,6 +1523,10 @@ impl App {
         }
 
         self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {
@@ -2269,7 +2285,7 @@ impl App {
             // restarts; the banner returns automatically when a newer
             // release ships (per #1140).
             //
-            // No `needs_redraw = true` here: that forces a `terminal.clear()`
+            // No `needs_redraw = true` here: that forces a `clear_terminal`
             // before the next event arrives, so the whole screen blanks for
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
@@ -2345,10 +2361,10 @@ impl App {
         let result =
             crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
-        // Forcing a full redraw on return so the home screen redraws
-        // any cells the acp view painted over.
+        // Force a full redraw so the home screen repaints any cells the acp
+        // view painted over. The main loop's redraw branch runs `clear_terminal`
+        // on the next iteration, so don't clear again here.
         self.needs_redraw = true;
-        terminal.clear()?;
         if let Err(e) = result {
             self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
@@ -2499,17 +2515,8 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                let stale_sid = self.home.execute_send_message(&id, &message);
-                match stale_sid {
-                    Some(sid) => {
-                        self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; sent to fresh session (history not loaded)"
-                        )));
-                    }
-                    None => {
-                        self.update_status = None;
-                    }
-                }
+                self.home.execute_send_message(&id, &message);
+                self.update_status = None;
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -2531,13 +2538,10 @@ impl App {
                 // the smaller pane, and the first capture would render
                 // shifted up.
                 self.update_status = match &outcome {
-                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
-                    ))),
                     // On clean ready, drop the toast entirely. On Err the
                     // info_dialog already carries the failure detail, so the
                     // transient toast just gets in the way.
-                    Ok(None) | Err(()) => None,
+                    Ok(()) | Err(()) => None,
                 };
                 if outcome.is_ok() {
                     self.draw(terminal)?;
@@ -2711,10 +2715,11 @@ impl App {
                     )));
                     return Ok(());
                 }
-                Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                     self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {stale_sid}; started fresh (history not loaded)"
+                        "Resume failed for sid {sid}; preserved for retry"
                     )));
+                    return Ok(());
                 }
                 Ok(_) => {}
             }
@@ -2741,6 +2746,11 @@ impl App {
         self.home.reload()?;
         self.home
             .apply_status_updates_without_hooks(attached_status_updates);
+        // The user just viewed this session (and any turn that finished
+        // during the attach was applied above without the live-send
+        // exemption). Clear its unread marker on return so the round-trip
+        // nets to read.
+        self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
         // Persist so the attach-return bump survives aoe restart. Same
         // reasoning as the send-message path in home/input.rs: without a

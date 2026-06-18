@@ -19,9 +19,11 @@ pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
+pub mod restart;
 pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod settings_schema;
+pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub mod worktree_edit;
@@ -50,6 +52,27 @@ pub use instance::{
     Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     TMUX_SESSION_GONE_ERROR,
 };
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide cache of the `session.unread_indicator` toggle (default on).
+/// The TUI refreshes it via [`set_unread_enabled`] on startup and whenever
+/// config is re-applied, so a runtime settings change takes effect without a
+/// restart. Defaults to `true` so the feature is on out of the box before the
+/// first config apply. Read on the hot Attention-sort path, hence a plain
+/// atomic load rather than threading the flag through every sort helper.
+static UNREAD_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the unread-session indicator feature is enabled.
+pub fn unread_enabled() -> bool {
+    UNREAD_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Update the cached unread-indicator flag from resolved config.
+pub fn set_unread_enabled(on: bool) {
+    UNREAD_ENABLED.store(on, Ordering::Relaxed);
+}
+
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
@@ -63,7 +86,7 @@ pub use repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::atomic_write;
+pub(crate) use storage::{atomic_write, atomic_write_following_symlinks, resolve_symlink_chain};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,

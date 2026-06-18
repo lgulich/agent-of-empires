@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { mergeRegisteredProjects, normalizeProjectPathKey } from "../registeredProjects";
+import { mergeRegisteredProjects, normalizeProjectPathKey, unpinnedSavedProjects } from "../registeredProjects";
 import { repoGroupToSidebarGroup, sidebarGroupShouldRender } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID } from "../../hooks/useRepoGroups";
 import type { ProjectInfo, RepoGroup, Workspace } from "../types";
@@ -42,8 +42,10 @@ function repoGroup(repoPath: string, over: Partial<RepoGroup> = {}): RepoGroup {
   };
 }
 
+// Defaults to pinned: most of these cases assert the empty-header behavior,
+// which only pinned projects get (#2208). Unpinned cases pass `{ pinned: false }`.
 function project(path: string, over: Partial<ProjectInfo> = {}): ProjectInfo {
-  return { name: path.split("/").pop() ?? path, path, scope: "global", ...over };
+  return { name: path.split("/").pop() ?? path, path, scope: "global", pinned: true, ...over };
 }
 
 describe("normalizeProjectPathKey", () => {
@@ -78,6 +80,32 @@ describe("mergeRegisteredProjects", () => {
     expect(merged[0]!.repoPath).toBe("/work/beta");
     expect(merged[0]!.displayName).toBe("beta");
     expect(merged[0]!.workspaces).toHaveLength(0);
+    expect(merged[0]!.registeredProjects).toHaveLength(1);
+  });
+
+  it("does NOT append a header for a saved-but-unpinned repo with no live group", () => {
+    // A project added via the Projects view defaults to unpinned: saved, but
+    // not forced into the sidebar. See #2208.
+    const merged = mergeRegisteredProjects([], [project("/work/saved", { pinned: false })]);
+    expect(merged).toHaveLength(0);
+  });
+
+  it("appends the header when at least one registration for the path is pinned", () => {
+    // Same path saved unpinned in one scope and pinned in another: the pin wins.
+    const merged = mergeRegisteredProjects(
+      [],
+      [
+        project("/work/beta", { scope: "global", pinned: false }),
+        project("/work/beta", { scope: "profile", pinned: true }),
+      ],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.repoPath).toBe("/work/beta");
+  });
+
+  it("attaches a saved-but-unpinned entry to a populated group (for the context menu)", () => {
+    const merged = mergeRegisteredProjects([repoGroup("/work/alpha")], [project("/work/alpha", { pinned: false })]);
+    expect(merged).toHaveLength(1);
     expect(merged[0]!.registeredProjects).toHaveLength(1);
   });
 
@@ -137,5 +165,70 @@ describe("SidebarGroup pin derivation + render gating", () => {
     const sg = repoGroupToSidebarGroup(repoGroup("/work/gamma"));
     expect(sg.pinned).toBe(false);
     expect(sg.pinnedEmpty).toBe(false);
+  });
+
+  it("treats a populated saved-but-unpinned repo as not pinned (#2208)", () => {
+    const [g] = mergeRegisteredProjects([repoGroup("/work/alpha")], [project("/work/alpha", { pinned: false })]);
+    const sg = repoGroupToSidebarGroup(g!);
+    // The entry is attached (so the menu can offer Pin) but there is no marker.
+    expect(sg.registeredProjects).toHaveLength(1);
+    expect(sg.pinned).toBe(false);
+    expect(sg.pinnedEmpty).toBe(false);
+  });
+});
+
+describe("unpinnedSavedProjects (sidebar Projects section, #2212)", () => {
+  // A workspace whose only session is archived, so workspaceIsSunk() is true.
+  function sunkWorkspace(repoPath: string): Workspace {
+    return {
+      ...workspace(repoPath),
+      sessions: [{ archived_at: "2026-01-01T00:00:00Z" } as Workspace["sessions"][number]],
+    };
+  }
+
+  it("includes a non-pinned saved project with no live group", () => {
+    const out = unpinnedSavedProjects([], [project("/work/saved", { pinned: false })]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.repoPath).toBe("/work/saved");
+    expect(out[0]!.workspaces).toHaveLength(0);
+  });
+
+  it("excludes a pinned project (it renders above as a header)", () => {
+    const out = unpinnedSavedProjects([], [project("/work/pinned", { pinned: true })]);
+    expect(out).toHaveLength(0);
+  });
+
+  it("excludes a project that has a live session (renders above as a group)", () => {
+    const out = unpinnedSavedProjects([repoGroup("/work/alpha")], [project("/work/alpha", { pinned: false })]);
+    expect(out).toHaveLength(0);
+  });
+
+  it("includes a non-pinned saved project whose only sessions are sunk", () => {
+    const allSunk = repoGroup("/work/alpha", { workspaces: [sunkWorkspace("/work/alpha")] });
+    const out = unpinnedSavedProjects([allSunk], [project("/work/alpha", { pinned: false })]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.repoPath).toBe("/work/alpha");
+  });
+
+  it("collapses global + profile registrations into one row and sorts by name", () => {
+    const out = unpinnedSavedProjects(
+      [],
+      [
+        project("/work/zeta", { pinned: false }),
+        project("/work/alpha", { scope: "global", pinned: false }),
+        project("/work/alpha", { scope: "profile", pinned: false }),
+      ],
+    );
+    expect(out.map((g) => g.displayName)).toEqual(["alpha", "zeta"]);
+    expect(out[0]!.registeredProjects.map((p) => p.scope)).toEqual(["global", "profile"]);
+  });
+
+  it("applies resolved alias/color", () => {
+    const out = unpinnedSavedProjects([], [project("/work/beta", { pinned: false })], {
+      alias: () => "Beta",
+      color: () => "teal",
+    });
+    expect(out[0]!.displayName).toBe("Beta");
+    expect(out[0]!.color).toBe("teal");
   });
 });

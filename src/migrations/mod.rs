@@ -23,13 +23,15 @@ mod v012_acp_rename;
 mod v013_strip_profile_theme;
 mod v014_rename_default_theme;
 mod v015_rewrite_hook_strings;
+mod v016_clear_archived_tmux_gone_error;
+mod v017_rewrite_hook_strings_for_per_user_base;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 15;
+const CURRENT_VERSION: u32 = 17;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -114,6 +116,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "rewrite_hook_strings",
         run: v015_rewrite_hook_strings::run,
     },
+    Migration {
+        version: 16,
+        name: "clear_archived_tmux_gone_error",
+        run: v016_clear_archived_tmux_gone_error::run,
+    },
+    Migration {
+        version: 17,
+        name: "rewrite_hook_strings_for_per_user_base",
+        run: v017_rewrite_hook_strings_for_per_user_base::run,
+    },
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -179,7 +191,7 @@ fn get_current_version() -> u32 {
 fn set_version(version: u32) -> Result<()> {
     let dir = crate::session::get_app_dir()?;
     let version_file = dir.join(VERSION_FILE);
-    fs::write(&version_file, version.to_string())?;
+    crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
     debug!("Updated schema version to {}", version);
     Ok(())
 }

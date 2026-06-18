@@ -64,6 +64,13 @@ export interface SessionResponse {
    *  comes back as null on the wire; the web therefore only needs to
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
+  /** Unread marker mirroring `Instance::unread`: `true` when the session
+   *  needs attention (a finished turn the user hasn't engaged with, or a
+   *  manual flag), false / undefined when read. The sidebar paints an unread
+   *  accent and offers a right-click "Mark as read/unread" toggle, both gated
+   *  on the `session.unread_indicator` setting. The chip is suppressed for the
+   *  session currently open, which also clears the marker. */
+  unread?: boolean;
   has_managed_worktree: boolean;
   /** True when renaming this session also moves its worktree directory (the
    *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
@@ -88,6 +95,11 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** Smart-rename indicator for structured view sessions. `pending`: still
+   *  default-named and eligible, will auto-name on the next prompt; `running`:
+   *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
+   *  the sidebar auto-name chip. See session::smart_rename. */
+  smart_rename?: "inactive" | "pending" | "running";
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
@@ -117,6 +129,13 @@ export interface SessionResponse {
   /** Reason the agent provided when scheduling the wakeup. Only set
    *  when `next_wakeup_at` is also set. */
   next_wakeup_reason?: string;
+  /** True when the acp session has an armed `Monitor` (a background
+   *  watch). Drives a static "monitoring" sidebar badge. Cleared once a
+   *  fresh user prompt lands after the monitor was armed. */
+  monitor_active?: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Only set when `monitor_active` is true. */
+  monitor_description?: string;
 }
 
 export interface PlanSummary {
@@ -160,6 +179,13 @@ export interface ResizeMessage {
 
 export interface ActivateMessage {
   type: "activate";
+}
+
+/** Explicit take-over of the cross-surface size lock (banner click).
+ *  Separate from `activate`, which also fires on mount and must not
+ *  steal the size from a live owner on another device. */
+export interface ClaimMessage {
+  type: "claim";
 }
 
 /** Pause the pane's foreground process (SIGSTOP). Sent by mobile web
@@ -380,6 +406,10 @@ export interface ProjectInfo {
   scope: "global" | "profile";
   /** Default base branch for new worktree branches against this project's repo. */
   default_base_branch?: string;
+  /** Whether the project is pinned: shown as a sessionless sidebar header. A
+   *  registry entry is the saved project; the pin is the separate decision to
+   *  keep its header visible without sessions. See #2208. */
+  pinned: boolean;
 }
 
 /** Docker status returned by /api/docker/status */

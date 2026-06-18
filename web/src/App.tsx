@@ -7,6 +7,7 @@ import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
+import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
@@ -22,6 +23,7 @@ import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
+import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
@@ -41,10 +43,14 @@ import {
   markWebTourSeen,
   updateWorkspaceOrdering,
   createProject,
+  setProjectPinned,
   deleteProject,
+  setSessionUnread,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { toastBus } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -71,8 +77,7 @@ import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
-import { ProjectsView } from "./components/ProjectsView";
-import { ProfilesPage } from "./components/profiles/ProfilesPage";
+import { ProjectFormModal } from "./components/ProjectFormModal";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
 import { useWelcomePhase } from "./hooks/useWelcomePhase";
@@ -80,7 +85,7 @@ import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
-import type { SessionResponse } from "./lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -109,6 +114,7 @@ export default function App() {
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
+  const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
 
   useEffect(() => {
     const onTokenExpired = () => setTokenExpired(true);
@@ -139,6 +145,7 @@ export default function App() {
   useEffect(() => {
     fetchSettings().then((settings) => {
       setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
+      setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     });
   }, []);
 
@@ -179,8 +186,10 @@ export default function App() {
 
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
-      <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
-      <ElevationPrompt />
+      <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
+        <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        <ElevationPrompt />
+      </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
   );
 }
@@ -221,12 +230,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
-  const projectsMatch = useMatch("/projects");
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
-  const showProjects = projectsMatch !== null;
-  const showProfiles = profilesMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -240,6 +246,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSessionStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+
+  // Remember the active session and restore it on a PWA relaunch (#2103).
+  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
 
   // One-shot orphan-draft sweep once useSessions has settled its first
   // fetch (success or null). Catches acp:draft:<id> keys left behind
@@ -275,6 +284,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const { projects, refresh: refreshProjects } = useProjects();
   const {
     groups: repoGroups,
+    savedProjects,
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
@@ -396,6 +406,18 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [commentSendEnabled, diffComments.count]);
+
+  // Clear-on-view: opening a session (or having it open when its turn
+  // finishes) reads it, clearing the unread marker. Mirrors the TUI, where
+  // engaging with a session (open / live-send / dwell) clears it. The sidebar
+  // separately hides the chip for the active row, so there's no flash in the
+  // ~poll window before this lands.
+  const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
+  useEffect(() => {
+    if (unreadIndicatorEnabled && activeSessionId && activeSession?.unread) {
+      void setSessionUnread(activeSessionId, false);
+    }
+  }, [unreadIndicatorEnabled, activeSessionId, activeSession?.unread]);
 
   // Derive selectedFile/rightPanelView/pickerOpen/pairedMounted resets
   // during render to satisfy
@@ -678,36 +700,70 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile: latest?.profile || undefined,
         group: latest?.group_path || undefined,
-        skipToReview: true,
       });
       setShowSessionWizard(true);
     },
     [sessions],
   );
 
-  // Pin a repo: register it (scope global, matching the TUI's global
-  // registry) so its header persists with zero sessions, then refresh so the
-  // diamond / empty header reflects it. See #2047.
+  // Pin a repo so its header persists with zero sessions. If the repo is
+  // already a saved project, just set its pin flag (PATCH); otherwise register
+  // it pinned (scope global, matching the TUI's global registry). Then refresh
+  // so the diamond / empty header reflects it. See #2047, #2208.
   const handlePinProject = useCallback(
     async (repoPath: string) => {
-      const res = await createProject({ path: repoPath, scope: "global" });
-      if (!res.ok) {
-        toastBus.handler?.error(res.error ?? "Failed to pin project");
+      const key = normalizeProjectPathKey(repoPath);
+      const existing = projects.filter((p) => normalizeProjectPathKey(p.path) === key);
+      let failed: { error?: string } | undefined;
+      if (existing.length > 0) {
+        const results = await Promise.all(existing.map((p) => setProjectPinned(p.name, p.scope, true)));
+        failed = results.find((r) => !r.ok);
+      } else {
+        const res = await createProject({ path: repoPath, scope: "global", pinned: true });
+        if (!res.ok) failed = res;
+      }
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to pin project");
         return;
+      }
+      await refreshProjects();
+    },
+    [projects, refreshProjects],
+  );
+
+  // Unpin a repo: clear the pin flag on every pinned registry entry for its
+  // path (a path can be registered under both global and profile scope),
+  // keeping the saved project so it stays in the Projects view and the wizard.
+  // Only the Projects view's Remove deletes the entry. See #2208.
+  const handleUnpinProject = useCallback(
+    async (group: SidebarGroup) => {
+      const pinned = group.registeredProjects.filter((p) => p.pinned);
+      const results = await Promise.all(pinned.map((p) => setProjectPinned(p.name, p.scope, false)));
+      const failed = results.find((r) => !r.ok);
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to unpin project");
       }
       await refreshProjects();
     },
     [refreshProjects],
   );
 
-  // Unpin a repo: remove every registry entry for its path (a path can be
-  // registered under both global and profile scope), then refresh. See #2047.
-  const handleUnpinProject = useCallback(
-    async (group: SidebarGroup) => {
+  // Add / edit a saved project from the sidebar Projects section. The modal is
+  // open for `add` (no editProject) or `edit` (a specific registration); both
+  // refresh the registry on save. See #2212.
+  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null } | null>(null);
+  const handleAddProject = useCallback(() => setProjectForm({ editProject: null }), []);
+  const handleEditProject = useCallback((project: ProjectInfo) => setProjectForm({ editProject: project }), []);
+
+  // Remove a saved project: delete every registration for its path, then
+  // refresh. Confirms first since it is not undoable. See #2212.
+  const handleRemoveProject = useCallback(
+    async (group: RepoGroup) => {
+      if (!confirm(`Remove project '${group.displayName}' from the sidebar?`)) return;
       const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
       const failed = results.find((r) => !r.ok);
       if (failed) {
-        toastBus.handler?.error(failed.error ?? "Failed to unpin project");
+        toastBus.handler?.error(failed.error ?? "Failed to remove project");
       }
       await refreshProjects();
     },
@@ -767,31 +823,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     if (window.innerWidth < 768) setSidebarOpen(false);
   }, [navigate]);
 
-  const handleOpenProjects = useCallback(() => {
-    navigate("/projects");
-    if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
-
-  const handleCloseProjects = useCallback(() => {
-    if (activeSessionId) {
-      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
-    } else {
-      navigate("/");
-    }
-  }, [navigate, activeSessionId]);
-
-  const handleOpenProfiles = useCallback(() => {
-    navigate("/profiles");
-    if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
-
-  const handleCloseProfiles = useCallback(() => {
-    if (activeSessionId) {
-      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
-    } else {
-      navigate("/");
-    }
-  }, [navigate, activeSessionId]);
+  // Profiles moved into Settings as a tab; redirect the retired standalone
+  // route so old bookmarks and links still land somewhere valid.
+  useEffect(() => {
+    if (profilesMatch) navigate(`/settings/profiles${window.location.search}`, { replace: true });
+  }, [profilesMatch, navigate]);
 
   const handleCloseSettings = useCallback(() => {
     if (activeSessionId) {
@@ -847,7 +883,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleNewScratch = useCallback(() => {
     if (serverAbout?.read_only) return;
-    setWizardPrefill({ scratch: true, skipToReview: true });
+    setWizardPrefill({ scratch: true });
     setShowSessionWizard(true);
   }, [serverAbout?.read_only]);
 
@@ -981,6 +1017,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onLogout,
   });
 
+  const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
+  const settingsCommands = useSettingsCommands({
+    open: showPalette,
+    readOnly: !!serverAbout?.read_only,
+    onOpenSettingsTab: openSettingsTab,
+  });
+
   const renderContent = () => {
     if (showSettings) {
       return (
@@ -998,16 +1041,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             next.set("profile", p);
             setSearchParams(next, { replace: true });
           }}
+          readOnly={serverAbout?.read_only}
         />
       );
-    }
-
-    if (showProjects) {
-      return <ProjectsView onClose={handleCloseProjects} readOnly={serverAbout?.read_only} />;
-    }
-
-    if (showProfiles) {
-      return <ProfilesPage onClose={handleCloseProfiles} readOnly={serverAbout?.read_only} />;
     }
 
     // Refresh on `/session/<id>` paints once with `sessions === []` before
@@ -1245,12 +1281,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     sessionsLoaded &&
     !activeSessionId &&
     !showSettings &&
-    !showProjects &&
-    !showProfiles &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
-    !showPalette;
+    !showPalette &&
+    !projectForm;
   // First-run theme choice is phase one of onboarding. It decides on the same
   // settled-dashboard gate as the tour, then the tour follows once the modal
   // resolves so the two never overlap on first load.
@@ -1289,16 +1324,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           isOffline={!!error}
           isDevBuild={isDebugBuild(serverAbout)}
           onGoDashboard={handleGoDashboard}
-          sidebarColumnVisible={!showSettings && !showProjects && sidebarOpen}
-          rightColumnVisible={
-            isMdUp &&
-            !showSettings &&
-            !showProjects &&
-            !showProfiles &&
-            !!activeWorkspace &&
-            !!activeSession &&
-            !diffCollapsed
-          }
+          sidebarColumnVisible={!showSettings && sidebarOpen}
+          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
         />
 
         <DisconnectBanner />
@@ -1306,7 +1333,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <DashboardUpdateBanner />
 
         <div className="flex flex-1 min-h-0">
-          {!showSettings && !showProjects && (
+          {!showSettings && (
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
@@ -1326,9 +1353,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onCreateSession={handleCreateSession}
               onPinProject={handlePinProject}
               onUnpinProject={handleUnpinProject}
+              savedProjects={savedProjects}
+              onAddProject={handleAddProject}
+              onEditProject={handleEditProject}
+              onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
-              onProjects={handleOpenProjects}
-              onProfiles={handleOpenProfiles}
               onDeleteSession={handleDeleteSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
@@ -1362,6 +1391,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           />
         )}
 
+        {projectForm && (
+          <ProjectFormModal
+            initial={projectForm.editProject}
+            onClose={() => setProjectForm(null)}
+            onSaved={() => refreshProjects()}
+          />
+        )}
+
         {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
 
         {tour.tourElement}
@@ -1392,7 +1429,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           />
         )}
 
-        <CommandPalette open={showPalette} onClose={() => setShowPalette(false)} actions={commandActions} />
+        <CommandPalette
+          open={showPalette}
+          onClose={() => setShowPalette(false)}
+          actions={[...commandActions, ...settingsCommands]}
+        />
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker

@@ -18,6 +18,7 @@ vi.mock("../../hooks/usePluginUi", () => ({
 }));
 
 import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -86,17 +87,19 @@ function Row({
   ws,
   readOnly,
   onCreateSession,
+  isActive = false,
 }: {
   ws: Workspace;
   readOnly?: boolean;
   onCreateSession?: (repoPath: string) => void;
+  isActive?: boolean;
 }) {
   const workspaces = useMemo(() => [ws], [ws]);
   const triage = useSidebarTriage(workspaces);
   return (
     <SessionRow
       workspace={ws}
-      isActive={false}
+      isActive={isActive}
       isSelected={false}
       onActivate={() => {}}
       onCreateSession={onCreateSession}
@@ -105,6 +108,7 @@ function Row({
       onPinToggle={triage.pinToggle}
       onArchiveToggle={triage.archiveToggle}
       onSnooze={triage.snooze}
+      onUnreadToggle={triage.unreadToggle}
     />
   );
 }
@@ -142,6 +146,29 @@ describe("SessionRow chips", () => {
     expect(screen.queryByLabelText("Pinned")).not.toBeNull();
     expect(screen.queryByLabelText("Archived")).toBeNull();
     expect(screen.queryByLabelText("Snoozed")).toBeNull();
+  });
+
+  it("renders the monitoring badge when the first session has an armed monitor", () => {
+    // A monitor-parked session would otherwise look like a plain idle dot;
+    // the badge signals it is waiting on a background watch, not dead.
+    const ws = workspace("w-monitor", [session({ monitor_active: true, monitor_description: "clippy passes" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const badge = screen.getByLabelText("Monitoring clippy passes");
+    expect(badge.textContent).toContain("monitoring");
+  });
+
+  it("renders no monitoring badge when no monitor is armed", () => {
+    const ws = workspace("w-none", [session()]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText(/^Monitoring/)).toBeNull();
   });
 
   it("renders the Archived chip when any session is archived", () => {
@@ -193,8 +220,43 @@ describe("SessionRow chips", () => {
   });
 });
 
+describe("SessionRow smart-rename chip", () => {
+  it("renders the Auto-name chip when smart_rename is pending", () => {
+    const ws = workspace("w-pending", [session({ view: "structured", smart_rename: "pending" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).not.toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+
+  it("renders the Naming chip when smart_rename is running", () => {
+    const ws = workspace("w-running", [session({ view: "structured", smart_rename: "running" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Naming")).not.toBeNull();
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+  });
+
+  it("renders no smart-rename chip when inactive", () => {
+    const ws = workspace("w-inactive", [session({ view: "structured", smart_rename: "inactive" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText("Will auto-name")).toBeNull();
+    expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+});
+
 describe("SessionRow context menu", () => {
-  it("shows only the Unpin toggle when pinned", () => {
+  it("offers Unpin plus Archive and Snooze when pinned", () => {
     const ws = workspace("w-pinned", [session({ pinned_at: "2026-01-01T00:00:00Z" })]);
     render(
       <Wrap>
@@ -204,9 +266,11 @@ describe("SessionRow context menu", () => {
     const row = screen.getByTestId("sidebar-session-row");
     fireEvent.contextMenu(row);
     const menu = screen.getByTestId("sidebar-context-menu");
+    // Archiving or snoozing a pinned session clears the pin on the
+    // backend, matching the TUI, so the menu must not force unpin-first.
     expect(menu.textContent).toContain("Unpin");
-    expect(menu.textContent).not.toContain("Archive");
-    expect(menu.textContent).not.toContain("Snooze");
+    expect(menu.textContent).toContain("Archive");
+    expect(menu.textContent).toContain("Snooze");
   });
 
   it("shows only the Unarchive toggle when archived", () => {
@@ -495,5 +559,95 @@ describe("SessionRow triage actions", () => {
     );
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu-new-session")).toBeNull();
+  });
+});
+
+describe("SessionRow unread", () => {
+  it("renders the unread dot for an unread row", () => {
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
+  });
+
+  it("suppresses the unread dot on the active row (opening reads it)", () => {
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} isActive />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+  });
+
+  it("menu offers 'Mark as unread' for a read row and 'Mark as read' for an unread row", () => {
+    const read = workspace("w-read", [session({ id: "s-read" })]);
+    const { unmount } = render(
+      <Wrap>
+        <Row ws={read} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.getByTestId("sidebar-context-menu-unread").textContent).toContain("Mark as unread");
+    unmount();
+
+    const unread = workspace("w-unread", [session({ id: "s-unread", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={unread} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.getByTestId("sidebar-context-menu-unread").textContent).toContain("Mark as read");
+  });
+
+  it("'Mark as unread' fires PATCH /api/sessions/:id/unread with { unread: true } and shows the dot", async () => {
+    const ws = workspace("w-live", [session({ id: "sess-unread-it" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-unread"));
+    // Optimistic dot appears immediately, before the PATCH round-trips.
+    await vi.waitFor(() => expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull());
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-unread-it/unread");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ unread: true });
+  });
+
+  it("'Mark as read' on an unread row fires { unread: false }", async () => {
+    const ws = workspace("w-unread", [session({ id: "sess-read-it", unread: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-unread"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-read-it/unread");
+    expect(JSON.parse(init!.body as string)).toEqual({ unread: false });
+  });
+
+  it("hides the unread dot and menu item when the feature is disabled", () => {
+    const ws = workspace("w-unread", [session({ id: "s-off", unread: true })]);
+    render(
+      <Wrap>
+        <UnreadIndicatorContext.Provider value={false}>
+          <Row ws={ws} />
+        </UnreadIndicatorContext.Provider>
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-unread")).toBeNull();
   });
 });

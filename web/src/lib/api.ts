@@ -350,27 +350,6 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<bo
   }
 }
 
-/** Invoke a plugin terminal link handler. `rpc_method` is validated
- *  server-side against the plugin's declared link handlers. Returns true on a
- *  2xx response. */
-export async function postLinkAction(
-  id: string,
-  rpc_method: string,
-  text: string,
-  sessionId: string | null,
-): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/link-action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rpc_method, text, session_id: sessionId }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 /** Open (or refocus) a plugin terminal pane for the focused session. Returns
  *  the open handle (with its ws path) or null on failure. */
 export async function openPluginPane(
@@ -979,6 +958,43 @@ export async function switchAcpAgent(
   });
 }
 
+// --- Acp install agent (Tier 2 of #2109) ---
+
+export interface InstallAgentResponse {
+  session_id: string;
+  package: string;
+  success: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+  /** Other sessions blocked on the same adapter that were queued for an
+   *  automatic respawn (the install is global). See #2109. */
+  recovered_sessions: number;
+}
+
+/** Run `npm install -g` for the session's agent on the host. Opt-in and
+ *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
+ *  Resolves with the parsed body on 2xx; throws with the server's error
+ *  message on failure (disabled, sandboxed, not npm-installable, npm
+ *  missing) so the caller can surface why. The caller respawns the worker
+ *  separately via `useRespawnSession` on `success`. */
+export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = (await res.json().catch(() => null)) as
+    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
+  }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
+  return body as InstallAgentResponse;
+}
+
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
  *  after a `session/load` failure: the agent's model context is empty
  *  but the transcript is intact in SQLite, so the user can opt in to
@@ -1080,6 +1096,10 @@ export async function createProject(body: {
   scope?: "global" | "profile";
   allow_override?: boolean;
   default_base_branch?: string;
+  /** Pin the project on create (show it as a sessionless sidebar header).
+   *  Defaults to false server-side: the Projects view just saves, the sidebar
+   *  "Pin project" action sends true. See #2208. */
+  pinned?: boolean;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {
@@ -1141,6 +1161,39 @@ export async function updateProject(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Pin or unpin a saved project. Unpinning (pinned=false) keeps the registry
+ *  entry, so the project stays in the Projects view and the wizard; it just
+ *  drops from the sidebar. See #2208. */
+export async function setProjectPinned(
+  name: string,
+  scope: "global" | "profile",
+  pinned: boolean,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned }),
     });
     if (!res.ok) {
       const text = await res.text();
@@ -1612,6 +1665,24 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ minutes }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Flag a session manually unread (`true`) or mark it read (`false`, clearing
+ *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
+ *  computes the target from the current state so an optimistic update stays in
+ *  sync with the server. */
+export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/unread`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unread }),
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

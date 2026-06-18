@@ -330,7 +330,13 @@ fn sync_agent_config(
         };
 
         if metadata.is_dir() {
-            if copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
+            // copy_dirs (e.g. plugins, skills) are host -> sandbox pushes. Like
+            // the general file copy below, skip them once the sandbox has prior
+            // session data: re-copying a large tree (plugins can hold full git
+            // clones) on every restart stalled startup for tens of seconds and
+            // would clobber container-side changes. A fresh sandbox still gets
+            // them on its first launch.
+            if !has_prior_data && copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
                 let dest = sandbox_dir.join(&name);
                 if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
                     tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
@@ -448,16 +454,124 @@ fn rewrite_plugin_value_paths(
 
 /// Recursively copy a directory tree, following symlinks.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
+    let mut visited = std::collections::HashSet::new();
+    copy_dir_recursive_inner(src, dest, &mut visited)
+}
+
+/// Whether an I/O error during the copy means the destination filesystem can no
+/// longer accept writes, in which case continuing would silently produce a
+/// partial copy (a sandbox missing arbitrary files, reported as success). Those
+/// must abort the whole copy. Everything else (a single unreadable or dangling
+/// source entry) is skipped best-effort.
+fn is_fatal_copy_error(e: &std::io::Error) -> bool {
+    // ENOSPC (no space), EROFS (read-only fs), EDQUOT (quota). EDQUOT differs by
+    // platform (122 on Linux, 69 on macOS). raw_os_error covers all three more
+    // portably than the (partly unstable) ErrorKind variants.
+    matches!(e.raw_os_error(), Some(28) | Some(30) | Some(69) | Some(122))
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dest: &Path,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Break symlink cycles. We follow symlinks (a legitimately symlinked config
+    // dir should be copied), but a link that points back up its own tree would
+    // otherwise recurse forever; a real cycle under ~/.claude/plugins churned
+    // for 30s before aborting. Keying on the canonical (symlink-resolved) source
+    // path stops the second visit. A canonicalize failure (e.g. ELOOP) is
+    // exactly when we most need the guard, so skip the dir rather than descend
+    // blindly.
+    match std::fs::canonicalize(src) {
+        Ok(real) => {
+            if !visited.insert(real) {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping already-visited dir (symlink cycle?): {}",
+                    src.display()
+                );
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping dir (cannot resolve, possible symlink loop): {}: {}",
+                src.display(),
+                e
+            );
+            return Ok(());
+        }
+    }
+    // create_dir_all / read_dir failures: a filesystem that can't accept writes
+    // is fatal (silent partial copy); anything else means we just skip this
+    // subtree. This keeps the fail-soft behavior errno-aware and consistent.
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        if is_fatal_copy_error(&e) {
+            return Err(e).with_context(|| format!("creating {}", dest.display()));
+        }
+        tracing::warn!(
+            target: "session.profile",
+            "skipping dir (cannot create destination): {}: {}",
+            dest.display(),
+            e
+        );
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                target: "session.profile",
+                "skipping dir (cannot read): {}: {}",
+                src.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(target: "session.profile", "skipping entry in {}: {}", src.display(), e);
+                continue;
+            }
+        };
         let target = dest.join(entry.file_name());
-        // Follow symlinks so symlinked dirs/files are handled correctly.
-        let metadata = std::fs::metadata(entry.path())?;
+        // Follow symlinks so symlinked dirs/files are handled correctly; the
+        // visited-set guard above stops a cycle from looping forever. A single
+        // unreadable or dangling entry is skipped rather than aborting the whole
+        // copy: one Permission-denied file under ~/.claude/plugins used to fail
+        // the entire sync.
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.profile",
+                    "skipping {}: {}",
+                    entry.path().display(),
+                    e
+                );
+                continue;
+            }
+        };
         if metadata.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
+            // Propagate with `?`: the child only returns Err for a fatal
+            // (filesystem-full) error, so a cycle / unreadable subdir resolves to
+            // Ok inside the child and is skipped there, while a real out-of-space
+            // condition aborts the whole copy.
+            copy_dir_recursive_inner(&entry.path(), &target, visited)?;
+        } else if let Err(e) = std::fs::copy(entry.path(), &target) {
+            if is_fatal_copy_error(&e) {
+                return Err(e).with_context(|| format!("copying {}", entry.path().display()));
+            }
+            tracing::warn!(
+                target: "session.profile",
+                "skipping file {}: {}",
+                entry.path().display(),
+                e
+            );
         }
     }
     Ok(())
@@ -886,6 +1000,7 @@ fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_
         &config_path,
         hook_cfg.events,
         preserved_state,
+        crate::hooks::HookInstallTarget::Sandbox,
     ) {
         tracing::warn!(
             "Failed to refresh Codex hooks in sandbox config {}: {}",
@@ -1296,26 +1411,36 @@ pub(crate) fn build_container_config(
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
             if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
-                let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
-                    "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
-                )?;
-                if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-                    tracing::warn!(target: "session.profile",
-                        "Failed to create hook directory {}: {}",
-                        hook_dir.display(),
-                        e
-                    );
+                crate::session::validate_instance_id(instance_id).map_err(|e| {
+                    anyhow::anyhow!(
+                        "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
+                    )
+                })?;
+                match crate::hooks::ensure_instance_dir_path(instance_id) {
+                    Ok(hook_dir) => {
+                        let container_hook_path = format!(
+                            "{}/{instance_id}",
+                            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+                        );
+                        volumes.push(VolumeMount {
+                            host_path: hook_dir.to_string_lossy().to_string(),
+                            container_path: container_hook_path,
+                            read_only: false,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "session.profile",
+                            "Hook directory unavailable, skipping bind-mount; \
+                             agent boots without status hooks (pane detection takes over): {e:#}");
+                    }
                 }
-                volumes.push(VolumeMount {
-                    host_path: hook_dir.to_string_lossy().to_string(),
-                    container_path: hook_dir.to_string_lossy().to_string(),
-                    read_only: false,
-                });
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
                 let config_file = home.join(sidecar.sandbox_config_subpath);
-                if let Err(e) = (sidecar.install)(&config_file) {
+                if let Err(e) =
+                    (sidecar.install)(&config_file, crate::hooks::HookInstallTarget::Sandbox)
+                {
                     tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
@@ -1333,7 +1458,11 @@ pub(crate) fn build_container_config(
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
                         let settings_file = sandbox_dir.join(config_file_name);
                         let result = if agent.name == "codex" {
-                            crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                            crate::hooks::install_codex_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
                         } else {
                             crate::hooks::install_hooks(
                                 &settings_file,
@@ -1488,6 +1617,7 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
 
@@ -2560,6 +2690,87 @@ mod tests {
     }
 
     #[test]
+    fn test_is_fatal_copy_error_discriminates_storage_exhaustion() {
+        use std::io::Error;
+        // ENOSPC / EROFS / EDQUOT mean the destination can't accept writes;
+        // continuing would silently produce a partial copy, so these abort.
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(28)), "ENOSPC");
+        assert!(is_fatal_copy_error(&Error::from_raw_os_error(30)), "EROFS");
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(69)),
+            "EDQUOT (macOS)"
+        );
+        assert!(
+            is_fatal_copy_error(&Error::from_raw_os_error(122)),
+            "EDQUOT (Linux)"
+        );
+        // A single unreadable / missing source entry is best-effort skippable.
+        assert!(
+            !is_fatal_copy_error(&Error::from_raw_os_error(13)),
+            "EACCES"
+        );
+        assert!(!is_fatal_copy_error(&Error::from_raw_os_error(2)), "ENOENT");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_terminates_on_symlink_cycle() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub").join("file.txt"), "data").unwrap();
+        // Cycle: src/sub/loop -> src. The old code followed it and recursed
+        // forever; the visited-set guard must break it.
+        std::os::unix::fs::symlink(&src, src.join("sub").join("loop")).unwrap();
+
+        let dest = dir.path().join("dest");
+        // Must return rather than infinite-loop / stack-overflow.
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("sub").join("file.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_skips_bad_entry_inside_subdir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("good.txt"), "good").unwrap();
+        // Dangling symlink inside the copied tree. The old code propagated the
+        // stat error with `?` and aborted the whole copy (the log's "Failed to
+        // copy dir plugins: Permission denied"); now a single bad entry is
+        // skipped and the rest still copies.
+        std::os::unix::fs::symlink("/nonexistent/target", src.join("dangling")).unwrap();
+
+        let dest = dir.path().join("dest");
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
+        assert!(!dest.join("dangling").exists());
+    }
+
+    #[test]
+    fn test_copy_dirs_skipped_when_prior_data() {
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        fs::create_dir_all(host.join("plugins")).unwrap();
+        fs::write(host.join("plugins").join("p.txt"), "host-plugin").unwrap();
+        let sandbox = dir.path().join("sandbox");
+
+        // Prior container session sentinel.
+        fs::create_dir_all(sandbox.join("projects")).unwrap();
+
+        sync_agent_config(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
+        assert!(
+            !sandbox.join("plugins").exists(),
+            "copy_dirs must be skipped once the sandbox has prior session data, \
+             so a restart no longer re-copies the whole plugins tree"
+        );
+    }
+
+    #[test]
     fn test_preserve_files_seeded_when_missing() {
         let dir = TempDir::new().unwrap();
         let host = setup_host_dir(&dir);
@@ -2648,6 +2859,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_includes_repo_sandbox_settings() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -2880,6 +3092,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2956,6 +3169,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2998,12 +3212,22 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        assert!(
-            config
-                .volumes
-                .iter()
-                .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should be mounted"
+        let expected_container_path = format!(
+            "{}/{instance_id}",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        );
+        let mount = config
+            .volumes
+            .iter()
+            .find(|v| v.host_path == hook_dir.to_string_lossy())
+            .expect("status hook directory should be mounted");
+        assert_eq!(
+            mount.container_path, expected_container_path,
+            "container path must be the fixed in-container path, not the host euid path"
+        );
+        assert_ne!(
+            mount.host_path, mount.container_path,
+            "host (per-user) and container (fixed) paths MUST differ for the bind-mount remap"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
@@ -3018,6 +3242,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_sidecar_hooks_files() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3192,6 +3417,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3324,6 +3550,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_extra_env() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3368,6 +3595,7 @@ trusted_hash = "keep"
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3427,6 +3655,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]

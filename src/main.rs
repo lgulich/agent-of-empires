@@ -288,6 +288,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
+        // Pure redirect; needs no app data, so it must short-circuit before
+        // config/migration prework that can fail in constrained environments.
+        Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
         _ => {}
     }
 
@@ -333,6 +336,7 @@ async fn main() -> Result<()> {
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
+        Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command),

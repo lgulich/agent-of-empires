@@ -930,7 +930,7 @@ impl HomeView {
                         // No pending_intro_theme: the live preview
                         // already applied the chosen theme to
                         // `app.theme`; re-applying would force a
-                        // terminal.clear() (the close-flash). Same
+                        // `clear_terminal` (the close-flash). Same
                         // rationale as the keyboard Submit branch.
                     }
                 }
@@ -1512,7 +1512,7 @@ impl HomeView {
                     // applied the chosen theme to `app.theme` while the
                     // user was on the picker page. Re-dispatching here
                     // would only re-trigger `set_theme → needs_redraw`,
-                    // which forces a `terminal.clear()` on the next loop
+                    // which forces a `clear_terminal` on the next loop
                     // iteration — the close-flash the user sees.
                     return None;
                 }
@@ -2413,6 +2413,11 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor failed: {}", e);
                 }
             }
+            ActionId::ToggleUnread => {
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2593,6 +2598,18 @@ impl HomeView {
             .worktree_info
             .as_ref()
             .and_then(|w| w.base_branch.clone());
+
+        // A session on a non-git project runs in place, so there is no repo to
+        // diff against. Show a clear message instead of letting the git layer
+        // surface a raw "could not open repository" error.
+        if !crate::git::GitWorktree::is_git_repo(&repo_path) {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Git Repository",
+                "This session runs in place in a non-git directory, so there is no diff to show.",
+            ));
+            return;
+        }
+
         match DiffView::new_for_session(
             repo_path,
             Some(session_id_owned),
@@ -2903,7 +2920,8 @@ impl HomeView {
             };
             if let Some(inst) = self.get_instance(&id) {
                 let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window);
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread());
                 if is_actionable {
                     self.cursor = idx;
                     self.update_selected();
@@ -3473,12 +3491,12 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                let (is_archived, is_snoozed, is_unread) = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self
                         .get_instance(id)
-                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
-                        .unwrap_or((false, false)),
-                    super::Item::Group { .. } => (false, false),
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
+                        .unwrap_or((false, false, false)),
+                    super::Item::Group { .. } => (false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -3486,7 +3504,10 @@ impl HomeView {
                 // paths in step.
                 let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
                     .then_some(is_snoozed);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze)
+                // The unread toggle is always-on (any sort), so it shows
+                // whenever the feature is enabled.
+                let unread = crate::session::unread_enabled().then_some(is_unread);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread)
             });
             return true;
         }
@@ -3561,6 +3582,12 @@ impl HomeView {
                 // wakes it immediately.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
                     tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                }
+            }
+            ContextMenuAction::ToggleUnread => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),

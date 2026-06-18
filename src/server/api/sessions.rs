@@ -58,7 +58,7 @@ pub struct SessionResponse {
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
     /// True when the agent has flagged this session as urgent via the
-    /// `attention-urgent` hook (read from `/tmp/aoe-hooks/{id}/attention.json`
+    /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
     /// urgent rows above all non-urgent ones within their triage tier,
     /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
@@ -88,6 +88,14 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
+    /// Unread marker, mirroring `Instance::unread`: `true` when the session
+    /// needs attention (a finished turn the user hasn't engaged with, or a
+    /// manual flag), omitted when read. The web sidebar paints an unread
+    /// accent and offers a right-click "Mark as read/unread" toggle; gated
+    /// client-side on the `session.unread_indicator` setting. See the TUI's
+    /// `theme.unread`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
     pub has_managed_worktree: bool,
     /// Whether renaming this session also moves its worktree directory (the
     /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
@@ -95,6 +103,13 @@ pub struct SessionResponse {
     /// responses leave it `false` and the sidebar reads the list value. #1927.
     #[serde(default)]
     pub tie_workdir_to_name: bool,
+    /// Smart-rename indicator state for structured view sessions: `pending`
+    /// (still default-named and eligible, will auto-name on the next prompt),
+    /// `running` (a one-shot title call is in flight), or `inactive`. Populated
+    /// by `list_sessions`; single-session responses leave it `inactive`. See
+    /// `session::smart_rename`.
+    #[serde(default)]
+    pub smart_rename: crate::session::smart_rename::SmartRenameState,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -161,6 +176,17 @@ pub struct SessionResponse {
     /// `next_wakeup_at` is also set. See #1091.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_wakeup_reason: Option<String>,
+    /// True when the structured view session has an armed `Monitor` tool
+    /// (a background watch). Unlike a scheduled wakeup there is no fire
+    /// time, so the sidebar shows a static "monitoring" badge rather than a
+    /// countdown. Cleared once a `UserPromptSent` lands after the monitor
+    /// was armed (the user took over).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub monitor_active: bool,
+    /// The `description` the agent gave the `Monitor` tool, shown as the
+    /// badge tooltip. Only set when `monitor_active` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_description: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -204,6 +230,7 @@ impl SessionResponse {
             crate::acp::supervisor::AcpWorkerState::Absent,
             None,
             None,
+            None,
         )
     }
 
@@ -217,7 +244,16 @@ impl SessionResponse {
         #[cfg(feature = "serve")] acp_worker_state: crate::acp::supervisor::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
+        // `Some(description)` when the session has an armed `Monitor` (the
+        // inner description is itself optional); `None` when none is armed.
+        // Mirrors `EventStore::latest_active_monitor`'s return so the caller
+        // forwards it verbatim.
+        active_monitor: Option<Option<String>>,
     ) -> Self {
+        let (monitor_active, monitor_description) = match active_monitor {
+            Some(description) => (true, description),
+            None => (false, None),
+        };
         Self {
             id: inst.id.clone(),
             title: inst.title.clone(),
@@ -258,12 +294,17 @@ impl SessionResponse {
             } else {
                 None
             },
+            // Surface the marker (omitted when read); the web gates the
+            // visual on the `session.unread_indicator` setting.
+            unread: inst.unread,
             has_managed_worktree: inst
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
             // Overlaid per-profile in list_sessions; see the field doc.
             tie_workdir_to_name: false,
+            // Overlaid in list_sessions; single-session responses stay inactive.
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -311,6 +352,8 @@ impl SessionResponse {
             plan_summary,
             next_wakeup_at,
             next_wakeup_reason,
+            monitor_active,
+            monitor_description,
         }
     }
 }
@@ -427,6 +470,11 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             } else {
                 (None, None)
             };
+            let active_monitor = if inst.is_structured() {
+                state.acp_event_store.latest_active_monitor(&inst.id)
+            } else {
+                None
+            };
             #[cfg(feature = "serve")]
             let acp_worker_state = worker_states
                 .get(&inst.id)
@@ -440,6 +488,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
+                active_monitor,
             )
         })
         .collect();
@@ -517,6 +566,58 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                     .tie_workdir_to_name
             });
             session.tie_workdir_to_name = tied;
+        }
+    }
+
+    // Overlay the smart-rename indicator. `running` comes from the live
+    // in-flight set; `pending` from the shared eligibility predicate, so the
+    // chip cannot drift from the runtime gate. Config resolved once per profile.
+    {
+        use crate::session::smart_rename::{check_eligible, SmartRenameState};
+        use std::collections::{HashMap, HashSet};
+        let inflight: HashSet<String> = state
+            .smart_rename_inflight
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let attempted: HashSet<String> = state
+            .smart_rename_attempted
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut cfg_cache: HashMap<String, (bool, HashMap<String, String>)> = HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+            if inflight.contains(&inst.id) {
+                resp.smart_rename = SmartRenameState::Running;
+                continue;
+            }
+            // A session whose one-shot already ran (and failed, since the name
+            // is still default) will not retry, so it is not pending either.
+            if attempted.contains(&inst.id) {
+                continue;
+            }
+            let (setting_on, overrides) = cfg_cache
+                .entry(inst.source_profile.clone())
+                .or_insert_with(|| {
+                    let cfg = crate::session::profile_config::resolve_config_or_warn(
+                        &inst.source_profile,
+                    )
+                    .session;
+                    (cfg.smart_rename, cfg.agent_command_override)
+                });
+            let eligible = check_eligible(
+                inst.is_structured(),
+                *setting_on,
+                &inst.title,
+                crate::agents::get_agent(&inst.tool),
+                inst.is_sandboxed(),
+                &inst.command,
+                overrides.contains_key(&inst.tool),
+            )
+            .is_ok();
+            if eligible {
+                resp.smart_rename = SmartRenameState::Pending;
+            }
         }
     }
 
@@ -746,6 +847,50 @@ fn apply_session_title_rename(inst: &mut Instance, title: String) {
     inst.title = title;
 }
 
+/// Quiesce a structured-view worker before its worktree directory is moved.
+/// A live ACP worker is pinned to the current cwd; `git worktree move` pulls
+/// that directory out, the worker crashes, and the supervisor respawns it at
+/// the stale baked-in cwd, crash-looping until the reconciler parks the
+/// session with a misleading install-the-adapter banner (#2260). The
+/// blocks_worktree_edit gate does not catch this because a structured session
+/// the user "stopped" sits at Idle yet still owns a live worker.
+///
+/// `shutdown` is the reversible teardown: it keeps the agent transcript and the
+/// instance's acp_session_id, so once the move lands the reconciler fresh-spawns
+/// at the new path and resumes context via session/load. Callers hold the
+/// session's instance_lock across shutdown plus move plus persist, and the
+/// reconciler re-reads project_path under that same lock, so the post-move
+/// respawn never targets the old path. No-op for a session with no live worker;
+/// refuses the move (409) if a live worker cannot be stopped, so the directory
+/// is never moved out from under one.
+async fn quiesce_structured_worker_for_worktree_move(
+    state: &Arc<AppState>,
+    id: &str,
+    is_structured: bool,
+) -> Result<(), axum::response::Response> {
+    if !is_structured {
+        return Ok(());
+    }
+    match state.acp_supervisor.shutdown(id).await {
+        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "could not stop structured-view worker before worktree move: {e}"
+            );
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "worker_shutdown_failed",
+                    "message": "Could not stop the structured view worker before renaming; retry in a moment"
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -785,7 +930,7 @@ pub async fn rename_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -800,6 +945,7 @@ pub async fn rename_session(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -840,6 +986,17 @@ pub async fn rename_session(
                 })),
             )
                 .into_response();
+        }
+
+        // Stop any live structured-view worker before the move so it can't
+        // crash on the pulled-out cwd and respawn-loop at the stale path
+        // (#2260). Done under the instance_lock held since the top of this
+        // function. Preserves the agent transcript so the reconciler resumes
+        // context at the new path.
+        if let Err(resp) =
+            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        {
+            return resp;
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
@@ -1065,7 +1222,7 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed) = {
+    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return (
@@ -1080,6 +1237,7 @@ pub async fn set_worktree_name(
             inst.status,
             inst.source_profile.clone(),
             inst.is_sandboxed(),
+            inst.is_structured(),
         )
     };
 
@@ -1128,6 +1286,14 @@ pub async fn set_worktree_name(
             })),
         )
             .into_response();
+    }
+
+    // Stop any live structured-view worker before the move so it can't crash on
+    // the pulled-out cwd and respawn-loop at the stale path (#2260). Held under
+    // the instance_lock acquired at the top of this function.
+    if let Err(resp) = quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+    {
+        return resp;
     }
 
     let wt = worktree_info.clone();
@@ -1412,7 +1578,7 @@ where
 /// instance untouched: persisting first is what keeps disk and memory from
 /// diverging when a write fails, and stops the archive/snooze side effects
 /// from firing on a write that never landed. See #1589.
-async fn persist_session_update<F>(
+pub(crate) async fn persist_session_update<F>(
     profile: String,
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
@@ -1692,6 +1858,17 @@ pub struct UpdateSnoozeBody {
     /// TUI dialog and CLI use also apply here.
     #[serde(default)]
     pub minutes: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUnreadBody {
+    /// `true` flags the session manually unread (a deliberate "flag for
+    /// later"); `false` marks it read, clearing both auto and manual markers.
+    /// The clear is the explicit one (web "Mark as read"); the auto-clear on
+    /// view is driven separately by the client, which only fires it for an
+    /// `auto` marker, so a `false` here never silently drops a manual flag the
+    /// user meant to keep.
+    pub unread: bool,
 }
 
 pub async fn update_session_pin(
@@ -2215,6 +2392,7 @@ pub async fn start_session(
         }
     }
 
+    let sync_base = instance.clone();
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
@@ -2230,11 +2408,15 @@ pub async fn start_session(
     .await;
 
     match restart_result {
-        Ok(Ok((started, _outcome))) => {
+        Ok(Ok((started, outcome))) => {
+            let resume_failed_sid = match &outcome {
+                crate::session::StartOutcome::ResumeFailed { sid } => Some(sid.clone()),
+                _ => None,
+            };
             let mut instances = state.instances.write().await;
             let response = match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) => {
-                    apply_post_restart_sync(inst, &started);
+                    apply_post_restart_sync(inst, &sync_base, &started);
                     SessionResponse::from_instance(
                         inst,
                         crate::claude_settings::read_tui_fullscreen(),
@@ -2248,6 +2430,17 @@ pub async fn start_session(
                         .into_response();
                 }
             };
+            if let Some(sid) = resume_failed_sid {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "resume_failed",
+                        "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        "resume_session_id": sid,
+                    })),
+                )
+                    .into_response();
+            }
             (StatusCode::OK, Json(serde_json::json!(response))).into_response()
         }
         Ok(Err(boxed)) => {
@@ -2256,7 +2449,7 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
                 inst.status = Status::Error;
                 inst.last_error = Some(msg.clone());
             }
@@ -2401,6 +2594,104 @@ pub async fn update_session_snooze(
     }
     #[cfg(not(feature = "serve"))]
     let _ = was_structured_view;
+
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+/// `PATCH /api/sessions/{id}/unread` — flag a session unread (`{"unread":true}`)
+/// or mark it read (`{"unread":false}`). Mirrors the TUI's `u` toggle, but the
+/// client computes the target from the current state rather than toggling
+/// server-side, so an optimistic UI update can't desync. No-op when the
+/// `session.unread_indicator` feature is off (the client hides the control
+/// then, but guard here too). Persist-then-mutate, like snooze.
+pub async fn update_session_unread(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let mark_unread = body.unread;
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Feature off: report the current state without mutating, matching the
+    // TUI's no-op when `session.unread_indicator` is disabled.
+    if crate::session::unread_enabled() {
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile,
+            "unread update",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    if mark_unread {
+                        inst.mark_unread();
+                    } else {
+                        inst.mark_read();
+                    }
+                }
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
+
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "unread update: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        if mark_unread {
+            inst.mark_unread();
+        } else {
+            inst.mark_read();
+        }
+    }
 
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -3648,19 +3939,38 @@ fn public_create_session_error(e: &anyhow::Error) -> String {
 /// a rapid second restart inside that window would see a stale
 /// `agent_session_id = None` and generate (and persist) a new UUID,
 /// silently orphaning the previous Claude conversation.
-fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
+fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    // Treat the pre-restart snapshot as a CAS baseline for peer-writable
+    // identity fields. If a poller/CLI/TUI peer changed the sid while the
+    // restart clone was blocking, that newer sid and its marker stay
+    // authoritative.
+    let sid_unchanged = live.agent_session_id == before.agent_session_id;
+    let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
+    if sid_unchanged {
+        live.agent_session_id = started.agent_session_id.clone();
+    }
+    if marker_unchanged && live.agent_session_id == started.agent_session_id {
+        live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
+    }
+}
+
+fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) {
     live.status = started.status;
-    live.last_error = None;
-    live.agent_session_id = started.agent_session_id.clone();
+    live.last_error = if started.status == Status::Error {
+        started.last_error.clone()
+    } else {
+        None
+    };
+    live.last_error_check = started.last_error_check;
+    apply_post_restart_identity_sync(live, before, started);
     live.last_start_time = started.last_start_time;
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
 
 /// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
-/// fields the resume-fallback cascade is responsible for: the post-cascade
-/// `agent_session_id` (either `None` after a bailed Tier-1 cleanup, or a
-/// fresh UUID acquired by Tier-2's `start_with_size_opts` ->
-/// `acquire_session_id`) and the updated `retroactive_capture_excludes`.
+/// fields the resume path is responsible for: the post-probe
+/// `agent_session_id`, the `resume_probe_failed_sid` marker, and the updated
+/// `retroactive_capture_excludes`.
 ///
 /// Intended for error paths where the cascade may have run but the caller
 /// does not want to touch user-visible status fields. `NotRunning` is the
@@ -3668,8 +3978,8 @@ fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
 /// `live.status` with `started.status` (typically `Starting` from the
 /// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
 /// as `Starting` until the 2s status poll loop reconciles.
-fn apply_cascade_state_sync(live: &mut Instance, started: &Instance) {
-    live.agent_session_id = started.agent_session_id.clone();
+fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    apply_post_restart_identity_sync(live, before, started);
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
 
@@ -3693,17 +4003,22 @@ fn apply_cascade_state_sync(live: &mut Instance, started: &Instance) {
 ///     `RESUME_PROBE_POST_SHELL_GRACE` (~2s) shortcut. Shell-wrapper
 ///     overrides charitably burn the full ~3s instead (see
 ///     `Instance::probe_settle`).
-///   * Cascade fires (Tier-1 detects a dead pane): Tier-1 returns Dead
-///     fast (`pane_dead`/`!exists` is unambiguous), then `kill_clean`
-///     (~100ms macOS grace) + Tier-2 tmux spawn + up to another
-///     `RESUME_PROBE_MAX`.
+///   * Probe failure (resume pane dies): Tier-1 returns Dead fast
+///     (`pane_dead`/`!exists` is unambiguous), then `kill_clean` (~100ms
+///     macOS grace) and a typed 409 response preserving the sid.
 ///
-/// HTTP clients should budget ~6-7s worst-case for the full Tier-1 +
-/// Tier-2 cascade and configure timeouts accordingly.
+/// HTTP clients should budget ~3-4s worst-case for the resume probe and
+/// configure timeouts accordingly.
 pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Serialize concurrent ensure calls for the same session. The decision
+    // phase reads tmux state and the restart phase mutates it; any other
+    // ensure for this id must wait so both see a consistent view.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
         return (
@@ -3713,12 +4028,6 @@ pub async fn ensure_session(
             .into_response();
     };
     drop(instances);
-
-    // Serialize concurrent ensure calls for the same session. The decision
-    // phase reads tmux state and the restart phase mutates it; any other
-    // ensure for this id must wait so both see a consistent view.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
 
     // Inspect tmux + make the restart decision on a blocking thread. Refresh
     // the cache first so rapid re-calls see the true current state (the
@@ -3799,6 +4108,7 @@ pub async fn ensure_session(
         }
     }
 
+    let sync_base = instance.clone();
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
@@ -3811,12 +4121,10 @@ pub async fn ensure_session(
                 return Err(Box::new((inst, e)));
             }
             // Surface the moved Instance on the Err arm so the caller can
-            // sync the cascade-cleared `agent_session_id` and updated
-            // `retroactive_capture_excludes` back to live state. Otherwise
-            // the live entry retains the stale sid in memory while disk has
-            // already been cleared, and subsequent calls within the
-            // `status_poll_loop` reload window (~2s) keep re-attempting
-            // resume with the bad sid. See `apply_post_restart_sync`.
+            // sync resume-path mutations back to live state. Otherwise the
+            // live entry can retain stale marker/sid state until the next
+            // `status_poll_loop` reload window (~2s). See
+            // `apply_post_restart_sync`.
             match inst.start_with_resume_fallback(None, false) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
@@ -3829,19 +4137,25 @@ pub async fn ensure_session(
         Ok(Ok((started, outcome))) => {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
             }
             let resume_outcome = match &outcome {
                 crate::session::StartOutcome::Resumed => "resumed",
-                crate::session::StartOutcome::Restarted { .. } => "restarted",
+                crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
                 crate::session::StartOutcome::Fresh => "fresh",
             };
             let mut body = serde_json::json!({
                 "status": "restarted",
                 "resume_outcome": resume_outcome,
             });
-            if let crate::session::StartOutcome::Restarted { stale_sid } = &outcome {
-                body["stale_session_id"] = serde_json::Value::String(stale_sid.clone());
+            if let crate::session::StartOutcome::ResumeFailed { sid } = &outcome {
+                body["status"] = serde_json::Value::String("resume_failed".to_string());
+                body["error"] = serde_json::Value::String("resume_failed".to_string());
+                body["message"] = serde_json::Value::String(format!(
+                    "Resume failed for sid {sid}; preserved for explicit retry"
+                ));
+                body["resume_session_id"] = serde_json::Value::String(sid.clone());
+                return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -3851,7 +4165,7 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &started);
+                apply_post_restart_sync(inst, &sync_base, &started);
                 inst.status = crate::session::Status::Error;
                 inst.last_error = Some(msg.clone());
             }
@@ -4678,14 +4992,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hook_base)]
     fn from_instance_surfaces_hook_urgent_flag() {
         // #1640: the web Attention sort needs `Instance::is_urgent()` on the
         // wire. Write the hook-side attention.json the agent would emit and
         // confirm it round-trips onto the response, then confirm a session
         // with no hook file reports urgent: false.
+        let (_g, _, _tmp_base) = crate::hooks::test_support::BaseGuard::ready();
         let inst = make_test_instance();
-        let dir = crate::hooks::hook_status_dir(&inst.id).expect("test id must be allowlist-safe");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .expect("guard must create instance subdir");
         std::fs::write(
             dir.join("attention.json"),
             r#"{"urgent":true,"urgent_reason":"needs input"}"#,
@@ -5117,13 +5433,14 @@ mod tests {
         live.last_error = Some("prior failure".to_string());
         live.agent_session_id = None;
         live.last_start_time = None;
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.status = Status::Starting;
         started.agent_session_id = Some("claude-uuid-restart".to_string());
         started.last_start_time = Some(std::time::Instant::now());
 
-        apply_post_restart_sync(&mut live, &started);
+        apply_post_restart_sync(&mut live, &before, &started);
 
         assert_eq!(live.status, Status::Starting);
         assert!(live.last_error.is_none());
@@ -5142,13 +5459,194 @@ mod tests {
         // existing ID, but the contract here is "started wins."
         let mut live = make_test_instance();
         live.agent_session_id = Some("stale-id".to_string());
+        let before = live.clone();
 
         let mut started = make_test_instance();
         started.agent_session_id = Some("fresh-id".to_string());
 
-        apply_post_restart_sync(&mut live, &started);
+        apply_post_restart_sync(&mut live, &before, &started);
 
         assert_eq!(live.agent_session_id.as_deref(), Some("fresh-id"));
+    }
+
+    #[test]
+    fn apply_post_restart_sync_propagates_resume_failed_marker_and_error() {
+        let mut live = make_test_instance();
+        live.status = Status::Running;
+        live.last_error = Some("prior failure".to_string());
+        live.agent_session_id = Some("sid-before".to_string());
+        live.resume_probe_failed_sid = None;
+        let before = live.clone();
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.agent_session_id = Some("sid-after".to_string());
+        started.resume_probe_failed_sid = Some("sid-after".to_string());
+        started.last_error =
+            Some("resume failed for sid sid-after; preserved for explicit retry".to_string());
+        started.last_error_check = Some(std::time::Instant::now());
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Error);
+        assert_eq!(
+            live.last_error.as_deref(),
+            Some("resume failed for sid sid-after; preserved for explicit retry")
+        );
+        assert!(live.last_error_check.is_some());
+        assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
+        assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
+    }
+
+    #[test]
+    fn apply_cascade_state_sync_propagates_marker_without_status() {
+        let mut live = make_test_instance();
+        live.status = Status::Running;
+        live.last_error = Some("keep me".to_string());
+        live.agent_session_id = Some("sid-before".to_string());
+        live.resume_probe_failed_sid = None;
+        let before = live.clone();
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.last_error = Some("resume failed".to_string());
+        started.agent_session_id = Some("sid-after".to_string());
+        started.resume_probe_failed_sid = Some("sid-after".to_string());
+
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.last_error.as_deref(), Some("keep me"));
+        assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
+        assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
+    }
+
+    #[test]
+    fn apply_post_restart_sync_preserves_peer_sid_write() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("stale-restart-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = make_test_instance();
+        live.agent_session_id = Some("peer-fresh-sid".to_string());
+        live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
+        started.last_error = Some("resume failed".to_string());
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Error);
+        assert_eq!(live.last_error.as_deref(), Some("resume failed"));
+        assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    fn apply_post_restart_sync_preserves_peer_marker_for_same_sid() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("same-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = before.clone();
+        live.resume_probe_failed_sid = Some("same-sid".to_string());
+
+        let mut started = before.clone();
+        started.status = Status::Starting;
+        started.resume_probe_failed_sid = None;
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Starting);
+        assert_eq!(live.agent_session_id.as_deref(), Some("same-sid"));
+        assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("same-sid"));
+    }
+
+    #[test]
+    fn apply_cascade_state_sync_preserves_peer_sid_write() {
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("stale-restart-sid".to_string());
+        before.resume_probe_failed_sid = None;
+
+        let mut live = make_test_instance();
+        live.status = Status::Running;
+        live.last_error = Some("keep me".to_string());
+        live.agent_session_id = Some("peer-fresh-sid".to_string());
+        live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+        let mut started = make_test_instance();
+        started.status = Status::Error;
+        started.last_error = Some("resume failed".to_string());
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
+
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.last_error.as_deref(), Some("keep me"));
+        assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn send_message_post_restart_save_preserves_peer_sid_write() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+
+        let profile = "send-post-restart-peer-sid";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut seed = make_test_instance();
+        let id = seed.id.clone();
+        seed.agent_session_id = Some("peer-fresh-sid".to_string());
+        seed.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let mut sync_base_for_save = make_test_instance();
+        sync_base_for_save.id = id.clone();
+        sync_base_for_save.agent_session_id = Some("stale-restart-sid".to_string());
+        sync_base_for_save.resume_probe_failed_sid = None;
+
+        let mut started_for_save = make_test_instance();
+        started_for_save.id = id.clone();
+        started_for_save.status = Status::Starting;
+        started_for_save.agent_session_id = Some("stale-restart-sid".to_string());
+        started_for_save.resume_probe_failed_sid = None;
+
+        storage
+            .update(|all, _groups| {
+                if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id) {
+                    apply_post_restart_sync(disk_inst, &sync_base_for_save, &started_for_save);
+                    disk_inst.touch_last_accessed();
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let reloaded = storage.load().unwrap();
+        let disk = reloaded.iter().find(|i| i.id == seed.id).unwrap();
+        assert_eq!(disk.status, Status::Starting);
+        assert_eq!(disk.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert_eq!(
+            disk.resume_probe_failed_sid.as_deref(),
+            Some("peer-fresh-sid")
+        );
+        assert!(disk.last_accessed_at.is_some());
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
@@ -5343,6 +5841,51 @@ mod tests {
         assert!(create_source.contains("std::path::Path::new(&body.path)"));
         assert!(!create_source[validation..spawn_blocking].contains("command_override"));
     }
+
+    #[test]
+    fn ensure_session_refreshes_instance_after_instance_lock() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let start = source.find("pub async fn ensure_session").unwrap();
+        let end = source.find("pub async fn ensure_terminal").unwrap();
+        let ensure_source = &source[start..end];
+        let lock = ensure_source
+            .find("let inst_lock = state.instance_lock(&id).await")
+            .unwrap();
+        let read = ensure_source
+            .find("let instances = state.instances.read().await")
+            .unwrap();
+        let sync_base = ensure_source
+            .find("let sync_base = instance.clone()")
+            .unwrap();
+
+        assert!(lock < read);
+        assert!(read < sync_base);
+    }
+
+    #[test]
+    fn send_message_refreshes_instance_after_instance_lock() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let start = source.find("pub async fn send_message").unwrap();
+        let send_source = &source[start..];
+        let lock = send_source
+            .find("let inst_lock = state.instance_lock(&id).await")
+            .unwrap();
+        let read = send_source
+            .find("let instances = state.instances.read().await")
+            .unwrap();
+        let sync_base = send_source
+            .find("let sync_base = instance.clone()")
+            .unwrap();
+
+        assert!(lock < read);
+        assert!(read < sync_base);
+    }
     // ── validate_diff_path: security regression tests ──────────────────────────
     //
     // Regression for a path-traversal vulnerability in the first cut of the
@@ -5477,6 +6020,19 @@ mod tests {
         let out = truncate_title("☃☃☃☃☃", 3);
         assert_eq!(out, "☃☃…");
         assert_eq!(out.chars().count(), 3);
+    }
+
+    #[test]
+    fn session_response_serializes_unread_marker() {
+        use crate::session::Instance;
+        let mut inst = Instance::new("t", "/tmp");
+        // Read: the field is omitted from the wire (skip_serializing_if false).
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(json.get("unread").is_none());
+        // Unread serializes as a bare boolean the web reads directly.
+        inst.unread = true;
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert_eq!(json["unread"], serde_json::json!(true));
     }
 
     fn step(
@@ -5949,6 +6505,7 @@ fn default_revive() -> bool {
 
 enum SendKeysError {
     NotRunning,
+    ResumeFailed(String),
     Transient(Status),
     StructuredView,
     Tmux(anyhow::Error),
@@ -5982,6 +6539,13 @@ pub async fn send_message(
             .into_response();
     }
 
+    // Serialize concurrent sends (and other tmux mutations) for this id.
+    // Without this, two POSTs racing against the same session would issue
+    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
+    // inside the pane.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
         return (
@@ -5992,13 +6556,7 @@ pub async fn send_message(
     };
     drop(instances);
 
-    // Serialize concurrent sends (and other tmux mutations) for this id.
-    // Without this, two POSTs racing against the same session would issue
-    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
-    // inside the pane.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
+    let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
     let revive = req.revive;
@@ -6009,10 +6567,9 @@ pub async fn send_message(
         //
         // The closure surfaces both `inst_owned` AND the
         // `EnsureReadyOutcome` on the Err arm so the caller can sync
-        // the post-cascade `agent_session_id` (None after Tier-1
-        // cleanup, or the fresh UUID acquired by Tier-2) and the
-        // updated `retroactive_capture_excludes` back to live state
-        // regardless of which post-cascade failure path fires. The
+        // post-resume-path mutations (`agent_session_id`, failure marker,
+        // and `retroactive_capture_excludes`) back to live state regardless
+        // of which failure path fires. The
         // outcome lets the caller distinguish cascade-fired
         // (`Respawned`/`Started`) from the no-op `AlreadyAlive` path
         // so a sync only happens when there's actual cascade state to
@@ -6035,7 +6592,7 @@ pub async fn send_message(
                     // false. `EnsureReadyError::Tmux` may be either
                     // pre-cascade (tmux_session() / start_with_size
                     // subprocess failure: `inst_owned` unmutated) or
-                    // post-cascade (Tier-2 bail: mutations committed).
+                    // post-resume-path (mutations committed).
                     // The Tmux outer arm syncs unconditionally and
                     // covers both shapes; the others (Transient /
                     // StructuredView) bail before any mutation.
@@ -6049,6 +6606,13 @@ pub async fn send_message(
         } else {
             EnsureReadyOutcome::AlreadyAlive
         };
+        if let EnsureReadyOutcome::ResumeFailed { sid } = &outcome {
+            return Err(Box::new((
+                inst_owned,
+                outcome.clone(),
+                SendKeysError::ResumeFailed(sid.clone()),
+            )));
+        }
         let tmux_session = match inst_owned.tmux_session() {
             Ok(s) => s,
             Err(e) => return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e)))),
@@ -6076,7 +6640,7 @@ pub async fn send_message(
             let mut instances = state.instances.write().await;
             let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
-                    apply_post_restart_sync(i, &started);
+                    apply_post_restart_sync(i, &sync_base, &started);
                 }
                 i.touch_last_accessed();
                 i.source_profile.clone()
@@ -6087,6 +6651,7 @@ pub async fn send_message(
             };
             drop(instances);
             let id_for_save = id.clone();
+            let sync_base_for_save = sync_base.clone();
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
@@ -6094,7 +6659,11 @@ pub async fn send_message(
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if !outcome_already_alive {
-                                apply_post_restart_sync(disk_inst, &started_for_save);
+                                apply_post_restart_sync(
+                                    disk_inst,
+                                    &sync_base_for_save,
+                                    &started_for_save,
+                                );
                             }
                             disk_inst.touch_last_accessed();
                         }
@@ -6104,53 +6673,48 @@ pub async fn send_message(
                     }
                 }
             });
-            let mut body = serde_json::json!({"sent": true});
-            let stale_sid = match &outcome {
-                EnsureReadyOutcome::Respawned {
-                    stale_sid: Some(sid),
-                }
-                | EnsureReadyOutcome::Started {
-                    stale_sid: Some(sid),
-                } => Some(sid.clone()),
-                _ => None,
-            };
-            if let Some(sid) = stale_sid {
-                body["stale_session_id"] = serde_json::Value::String(sid);
-            }
-            (StatusCode::OK, Json(body)).into_response()
+            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
             // ensure_pane_ready did mutate state when the outcome is
-            // anything other than AlreadyAlive. The cascade itself only
-            // runs in `Respawned { stale_sid: Some(_) }`, but `Started`
-            // and `Respawned { stale_sid: None }` also touch fields the
-            // live entry needs to reflect (fresh sid from acquire,
-            // last_start_time, etc.). Sync only when work happened.
+            // anything other than AlreadyAlive. `Started` and `Respawned`
+            // touch fields the live entry needs to reflect (fresh sid from
+            // acquire, last_start_time, etc.). Sync only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             match send_err {
                 SendKeysError::NotRunning => {
-                    // External kill or remain-on-exit-off Tier-2 crash can
-                    // race ensure_pane_ready's Alive decision against the
-                    // tmux_session.exists() check. Propagate the
-                    // post-cascade agent_session_id (fresh UUID acquired
-                    // in place of the stale, or None for Tier-1 cleanup)
-                    // and the updated excludes when applicable so the
-                    // next call won't orphan or re-attempt resume with
-                    // the bad sid; use the narrow sync helper to leave
-                    // status and last_error untouched (NotRunning is
+                    // External kill or remain-on-exit-off crash can race
+                    // ensure_pane_ready's Alive decision against the
+                    // tmux_session.exists() check. Propagate resume-path
+                    // state when applicable; use the narrow sync helper to
+                    // leave status and last_error untouched (NotRunning is
                     // recoverable; `started.status = Starting` from
-                    // finalize_launch would briefly mis-paint a broken
-                    // pane).
+                    // finalize_launch would briefly mis-paint a broken pane).
                     if did_work {
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                            apply_cascade_state_sync(i, &started);
+                            apply_cascade_state_sync(i, &sync_base, &started);
                         }
                     }
                     (
                         StatusCode::CONFLICT,
                         Json(serde_json::json!({"error": "session_not_running"})),
+                    )
+                        .into_response()
+                }
+                SendKeysError::ResumeFailed(sid) => {
+                    let mut instances = state.instances.write().await;
+                    if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                        apply_post_restart_sync(i, &sync_base, &started);
+                    }
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "resume_failed",
+                            "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                            "resume_session_id": sid,
+                        })),
                     )
                         .into_response()
                 }
@@ -6173,15 +6737,15 @@ pub async fn send_message(
                     // Sync cascade-mutated fields back to live state. Mirror
                     // `ensure_session`'s Err arm: full sync, then override
                     // `status` and `last_error` so observers don't see
-                    // `Status::Starting` (set by `finalize_launch` before
-                    // Tier-2 bail) on a broken session. Tmux Err is the
+                    // `Status::Starting` (set by `finalize_launch`) on a
+                    // broken session. Tmux Err is the
                     // catch-all for both pre-cascade tmux failures (where
                     // `started` is unmutated and the sync is a no-op) and
-                    // post-cascade Tier-2 bails (where the sync propagates
-                    // the cleared sid + updated excludes).
+                    // post-resume-path failures (where durable resume state
+                    // must be copied back from the clone).
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &started);
+                        apply_post_restart_sync(i, &sync_base, &started);
                         i.status = crate::session::Status::Error;
                         i.last_error = Some(msg);
                     }
@@ -6340,6 +6904,7 @@ mod workspace_ordering_tests {
             scratch: false,
             has_managed_worktree: false,
             tie_workdir_to_name: false,
+            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {
@@ -6363,11 +6928,14 @@ mod workspace_ordering_tests {
             plan_summary: None,
             next_wakeup_at: None,
             next_wakeup_reason: None,
+            monitor_active: false,
+            monitor_description: None,
             favorited: false,
             urgent: false,
             pinned_at: None,
             archived_at: None,
             snoozed_until: None,
+            unread: false,
         }
     }
 

@@ -254,6 +254,73 @@ export type ElicitationResolution =
   | { action: "decline" }
   | { action: "cancel" };
 
+/** One answered question rendered for the transcript. Mirror of
+ *  `ElicitationAnswer` in src/acp/elicitations.rs. Carried on
+ *  `ElicitationResolved` (server-rendered) and rebuilt locally by the
+ *  optimistic path. See #2209. */
+export interface ElicitationAnswer {
+  question: string;
+  answer: string;
+}
+
+/** Narrow a message-metadata payload to a non-empty answer list, so
+ *  UserText can pick the card over the plain-text fallback. */
+export function isElicitationAnswersPayload(value: unknown): value is ElicitationAnswer[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (x) =>
+        typeof x === "object" &&
+        x !== null &&
+        typeof (x as ElicitationAnswer).question === "string" &&
+        typeof (x as ElicitationAnswer).answer === "string",
+    )
+  );
+}
+
+/** Separator the adapter wedges between an AskUserQuestion option's label and
+ *  its description (`"<label> <sep> <description>"`). Written as an escape so
+ *  the em dash never appears literally in source. Mirrors `OPTION_DESC_SEP` in
+ *  AskUserQuestionCard and `OPTION_DESC_SEP` in src/acp/elicitations.rs. */
+const OPTION_DESC_SEP = " \u2014 ";
+
+/** Map a selected option value to its human label. A generic MCP form sends a
+ *  machine token as the value and the display text as the label; AskUserQuestion
+ *  sends the label as the value (with `label` possibly carrying a trailing
+ *  `"value <sep> description"`), so the bare value is kept there. */
+function selectLabel(question: ElicitationQuestion, raw: string): string {
+  const opt = question.options.find((o) => o.value === raw);
+  if (!opt) return raw;
+  return opt.label.startsWith(`${raw}${OPTION_DESC_SEP}`) ? raw : opt.label;
+}
+
+/** Render a submitted answer value for display, mapping select values to their
+ *  option labels. */
+function renderAnswerValue(question: ElicitationQuestion, value: AnswerValue): string {
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.map((v) => selectLabel(question, v)).join(", ");
+  if (typeof value === "string") return selectLabel(question, value);
+  return String(value);
+}
+
+/** Build display-ready answer pairs from a form and the submitted answers,
+ *  in question order, omitting unanswered questions. Mirrors
+ *  `summarize_answers` in src/acp/elicitations.rs so the optimistic local
+ *  path renders the same row the server broadcasts. */
+export function summarizeAnswers(elicitation: Elicitation, answers: Record<string, AnswerValue>): ElicitationAnswer[] {
+  const out: ElicitationAnswer[] = [];
+  for (const question of elicitation.questions) {
+    const value = answers[question.field_key];
+    if (value === undefined) continue;
+    out.push({
+      question: question.title || question.field_key,
+      answer: renderAnswerValue(question, value),
+    });
+  }
+  return out;
+}
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -265,17 +332,23 @@ export type IncompatibleAgentDetail =
       installed: string;
       required: string;
       install_command: string;
+      /** True when the daemon can `npm install -g` this agent itself, so
+       *  the web can offer "Update & restart" (gated on the
+       *  `acp.allow_agent_install` setting). See #2109. */
+      auto_install: boolean;
     }
   | {
       kind: "missing_agent_info";
       expected_package: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "mismatched_agent_name";
       expected: string;
       received: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unparseable_agent_version";
@@ -283,6 +356,7 @@ export type IncompatibleAgentDetail =
       raw_version: string;
       required: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unsupported_protocol_version";
@@ -358,7 +432,13 @@ export type AcpEvent =
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
   | { ElicitationRequested: { elicitation: Elicitation } }
-  | { ElicitationResolved: { nonce: string; outcome: ElicitationOutcome } }
+  | {
+      ElicitationResolved: {
+        nonce: string;
+        outcome: ElicitationOutcome;
+        answers?: ElicitationAnswer[];
+      };
+    }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -413,6 +493,7 @@ export type AcpEvent =
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
+  | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } };
 
@@ -514,6 +595,12 @@ export interface AcpState {
    *  reconnect-replay can deliver the same frames again without
    *  double-applying them to state. */
   lastSeq: number;
+  /** Lowest seq whose rows are currently in `activity`, i.e. the
+   *  recent-first load watermark. 0 means nothing loaded yet (or the
+   *  whole history is loaded down to the start). The client pages older
+   *  history by requesting `?before=<oldestSeq>`; the reducer's `prepend`
+   *  action lowers it. See #2236. */
+  oldestSeq: number;
   /** True if the most recent broadcast told us we lagged. Cleared
    *  the next time the client successfully resyncs via the snapshot
    *  endpoint. */
@@ -632,6 +719,16 @@ export interface AcpState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the structured view banner next to the countdown. */
   nextWakeupReason: string | null;
+  /** True when the agent has an armed `Monitor` (a background watch).
+   *  Unlike a scheduled wakeup it has no fire time, so the UI shows a
+   *  static "monitoring" badge, not a countdown. A monitor firing
+   *  re-invokes the agent with activity but never a `UserPromptSent`, so
+   *  this persists across re-fires and clears only on the next
+   *  `UserPromptSent` (the user takes over). */
+  monitorArmed: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Null when none was provided or no monitor is armed. */
+  monitorDescription: string | null;
   /** True between a `CancelRequested` event (aoe sent `session/cancel`
    *  and armed the escalation watchdog) and the next `Stopped`. Drives
    *  the "Stopping..." spinner label and reveals the Force-stop
@@ -745,6 +842,7 @@ export interface ActivityRow {
     | "thinking"
     | "user_prompt"
     | "user_diff_comments"
+    | "elicitation_answered"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -774,6 +872,10 @@ export interface ActivityRow {
    *  ships them only at completion. Absent for text-only completions
    *  (those render from `text`). See #1818. */
   output?: ToolOutputBlock[];
+  /** Display-ready answers on an `elicitation_answered` row (the user's
+   *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
+   *  fallback; the card renders the structured pairs. See #2209. */
+  elicitationAnswers?: ElicitationAnswer[];
   at: string; // ISO-8601
 }
 
@@ -813,6 +915,7 @@ export function emptyAcpState(): AcpState {
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
+    oldestSeq: 0,
     lagged: false,
     startupError: null,
     incompatibleAgent: null,
@@ -831,6 +934,8 @@ export function emptyAcpState(): AcpState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
+    monitorArmed: false,
+    monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
     contextPrimerAvailable: null,
@@ -889,6 +994,11 @@ function applyNewTurnResets(next: AcpState): void {
       next.nextWakeupReason = null;
     }
   }
+  // A monitor has no fire time to gate on. Unlike a wakeup it never
+  // self-fires a prompt, so any UserPromptSent reaching here is the user
+  // taking over: clear the "monitoring" badge unconditionally.
+  next.monitorArmed = false;
+  next.monitorDescription = null;
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
@@ -1171,8 +1281,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ElicitationResolved" in event) {
-    const { nonce } = event.ElicitationResolved;
+    const { nonce, answers } = event.ElicitationResolved;
     next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
+    // Record the picked answer so it survives the card closing. Deduped by
+    // id, so this is a no-op if the optimistic local clear already added it
+    // (and the safety net when that clear never ran: cold replay, a second
+    // device). See #2209.
+    next.activity = appendElicitationAnswerRow(next.activity, nonce, answers ?? []);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1621,6 +1736,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
     return next;
   }
+  if ("MonitorArmed" in event) {
+    next.monitorArmed = true;
+    next.monitorDescription = event.MonitorArmed.description ?? null;
+    return next;
+  }
   if ("CancelRequested" in event) {
     // aoe sent session/cancel and armed the escalation watchdog; the
     // turn is still active. Surface "Stopping..." and the escalation
@@ -1719,6 +1839,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   return next;
 }
 
+/** Fold a self-contained run of frames from an empty state. Used by the
+ *  recent-first load to reduce an OLDER history page in isolation (so the
+ *  page's activity rows can be prepended without disturbing the live
+ *  reducer's optimistic / queue / approval state, which is not a pure
+ *  fold of the frame log), and to project the handshake snapshot. The
+ *  caller is responsible for the frames being a clean unit; backward
+ *  paging guarantees each page starts at a user-turn boundary. See #2236. */
+export function reduceFrames(frames: AcpFrame[]): AcpState {
+  return frames.reduce(applyEvent, emptyAcpState());
+}
+
 /** True when `rows` already carries a `tool_start` row for this id. */
 function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
   return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
@@ -1781,6 +1912,29 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
     return next.slice(next.length - activityLimit);
   }
   return next;
+}
+
+/** Append an `elicitation_answered` row recording the user's answers,
+ *  keyed by `elicitation-<nonce>` and deduped by id. Shared by the
+ *  optimistic local clear (renders from the pending card) and the
+ *  server-event handler (renders from the broadcast), so whichever lands
+ *  first wins and the other is a no-op even when the broadcast survives
+ *  seq dedupe. No row for empty answers (skip / cancel / teardown). See
+ *  #2209. */
+export function appendElicitationAnswerRow(
+  rows: ActivityRow[],
+  nonce: string,
+  answers: ElicitationAnswer[],
+): ActivityRow[] {
+  const id = `elicitation-${nonce}`;
+  if (answers.length === 0 || rows.some((r) => r.id === id)) return rows;
+  return pushActivity(rows, {
+    id,
+    kind: "elicitation_answered",
+    text: answers.map((a) => `${a.question}: ${a.answer}`).join("\n"),
+    elicitationAnswers: answers,
+    at: new Date().toISOString(),
+  });
 }
 
 /** Close any `tool_start` rows that never received a matching terminal
@@ -1859,6 +2013,7 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
  *  fully retired) and re-derive `turnActive` from the counters. */
 export function normaliseTurnCounters(
   state: AcpState & {
+    oldestSeq?: number;
     pendingUserPromptSeq?: number;
     lastStoppedSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
@@ -1894,8 +2049,16 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
+  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
+  // never sees undefined on a warm hydrate.
+  const oldestSeq =
+    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
+      ? Math.max(0, Math.floor(state.oldestSeq))
+      : 0;
   return {
     ...state,
+    oldestSeq,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,

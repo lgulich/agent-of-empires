@@ -66,15 +66,17 @@
 //! gap requires in-place string rewrite inside non-AoE matcher groups;
 //! tracked as a follow-up.
 //!
-//! ### Power-loss durability asymmetry across formats
+//! ### Power-loss durability across formats
 //!
-//! Only Codex routes its rewrite through `crate::session::atomic_write`
-//! (`hooks/mod.rs::write_codex_config`). JSON settings, settl, Hermes,
-//! and Kiro use `std::fs::write` (truncate+write). Power loss in that
-//! window leaves a 0-byte file; the v015 gate then fails closed on the
-//! corrupted parse and never auto-recovers. Recovery:
-//! `aoe uninstall && aoe add --cmd <agent>`. Routing every install path
-//! through `atomic_write` is tracked as a follow-up.
+//! Every install/uninstall path in `hooks/mod.rs` routes through
+//! `crate::session::atomic_write_following_symlinks` (resolve symlink
+//! chain, then temp file + fsync + rename + dir fsync on the resolved
+//! target). A power loss mid-rewrite either keeps the prior bytes intact
+//! or surfaces the freshly written bytes; partial writes are not
+//! observable. Symlinks at the destination (a common dotfile-manager
+//! pattern: `~/.claude/settings.json -> ~/dotfiles/...`) are followed
+//! rather than replaced, so the underlying dotfile target receives the
+//! rewrite and the symlink survives.
 //!
 //! ### Sandbox-image hooks are not rewritten
 //!
@@ -157,14 +159,19 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
-            install_codex_hooks_with_preserved_state(&target.path, target.events, preserved)
+            install_codex_hooks_with_preserved_state(
+                &target.path,
+                target.events,
+                preserved,
+                HookInstallTarget::Host,
+            )
         }
         HookTargetKind::Sidecar(sidecar) => {
             // We deliberately do NOT invoke `sidecar.post_install_host`:
             // Kiro's `set_kiro_default_agent_if_builtin` shells out to
             // `kiro-cli`, which is launcher-state mutation, not file-content
             // reconciliation.
-            (sidecar.install)(&target.path)
+            (sidecar.install)(&target.path, HookInstallTarget::Host)
         }
     }
 }
@@ -315,7 +322,8 @@ mod tests {
                         canonical_set.push(canonical_session_id_command(HookInstallTarget::Host));
                     }
                     if let Some(status) = event_def.status {
-                        canonical_set.push(canonical_status_command(status));
+                        canonical_set
+                            .push(canonical_status_command(status, HookInstallTarget::Host));
                     }
                     assert!(
                         canonical_set.iter().any(|c| c == cmd),
@@ -485,7 +493,8 @@ mod tests {
         // canonical bytes adjacent to it (so live status detection works
         // for the next session).
         use crate::hooks::canonical_status_command;
-        let canonical_running = canonical_status_command("running");
+        let canonical_running =
+            canonical_status_command("running", crate::hooks::HookInstallTarget::Host);
         let found_hardened = pre_tool.iter().skip(1).any(|m| {
             m["hooks"].as_array().is_some_and(|arr| {
                 arr.iter()

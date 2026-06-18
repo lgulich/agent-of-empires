@@ -43,6 +43,7 @@ use super::dialogs::{
     WorktreeNameDialog,
 };
 use super::diff::DiffView;
+use super::restart_poller::RestartPoller;
 use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
@@ -372,6 +373,15 @@ pub(super) fn get_indent(depth: usize) -> &'static str {
 }
 
 pub(super) const ICON_IDLE: &str = "⠒";
+/// Unread rows swap the muted idle braille dot for a solid filled circle so
+/// the marker reads at a glance (and matches the web sidebar's unread dot).
+/// Paired with bold + `theme.unread` in the row formatter.
+pub(super) const ICON_UNREAD: &str = "●";
+/// How long a session row must stay selected (with the list in the foreground)
+/// before its unread marker clears. Long enough that arrowing past a row to get
+/// somewhere doesn't read it, short enough that pausing to read the preview
+/// does. See `tick_unread_dwell`.
+pub(super) const UNREAD_DWELL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";
@@ -615,6 +625,14 @@ pub struct HomeView {
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
 
+    // Performance: background restart (the start cascade shells out to docker
+    // and runs the before_start host hook, which can block for seconds)
+    pub(super) restart_poller: RestartPoller,
+    /// Sessions whose restart cascade is in flight on the restart poller.
+    /// Suppresses the StatusPoller's missing-tmux Error transition until the
+    /// worker reports back via `apply_restart_results`.
+    pub(super) restart_in_flight: std::collections::HashSet<String>,
+
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
     /// Set to true if user cancelled while creation was pending
@@ -699,6 +717,14 @@ pub struct HomeView {
     /// `DOUBLE_CLICK_THRESHOLD` on the same row, which then activates the
     /// session (same as pressing Enter on the selected row).
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+
+    /// Dwell tracker for unread clear-on-read: the currently-selected session
+    /// id and the instant the selection landed on it (while the list is the
+    /// foreground, no dialog/live-send). When the same row stays selected for
+    /// `UNREAD_DWELL`, the marker is cleared, distinguishing "scrolled past"
+    /// from "actually read." Reset on selection change, on leaving the list,
+    /// and on a manual unread toggle so re-flagging isn't instantly undone.
+    pub(super) unread_dwell: Option<(String, std::time::Instant)>,
 
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
@@ -1238,6 +1264,7 @@ impl HomeView {
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
+        crate::session::set_unread_enabled(resolved.session.unread_indicator);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -1358,6 +1385,8 @@ impl HomeView {
             pending_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            restart_poller: RestartPoller::new(),
+            restart_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -1379,6 +1408,7 @@ impl HomeView {
             list_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
+            unread_dwell: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
@@ -2347,14 +2377,16 @@ impl HomeView {
     }
 
     /// Snapshot of `self.instances` eligible for status polling.
-    /// In-flight recovery candidates are excluded; their post-cascade
-    /// `Instance` arrives via `apply_recovery_updates` and skipping the
-    /// parallel poll prevents racing transitions during the suppression
-    /// window.
+    /// In-flight recovery and restart candidates are excluded; their
+    /// post-cascade `Instance` arrives via `apply_recovery_updates` /
+    /// `apply_restart_results` and skipping the parallel poll prevents racing
+    /// transitions during the suppression window.
     pub(super) fn pollable_instances(&self) -> Vec<Instance> {
         self.instances
             .iter()
-            .filter(|i| !self.recovery_in_flight.contains(&i.id))
+            .filter(|i| {
+                !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
+            })
             .cloned()
             .collect()
     }
@@ -2455,6 +2487,31 @@ impl HomeView {
                         self.handle_status_transition(
                             &inst, old, new_status, play_sound, run_hooks,
                         );
+                    }
+                    // Auto-mark unread when a turn finishes (Running ->
+                    // Idle), unless the user is currently viewing this
+                    // session in live-send. This runs in both the with-
+                    // and without-hooks apply paths, so a *different*
+                    // session finishing while the user is attached
+                    // elsewhere still gets marked. The attached session
+                    // itself is cleared on attach-return, so a turn that
+                    // finishes during an attach nets to read.
+                    if crate::session::unread_enabled()
+                        && old == Status::Running
+                        && new_status == Status::Idle
+                    {
+                        let is_live_target = self
+                            .live_send
+                            .as_ref()
+                            .is_some_and(|s| s.session_id == update.id);
+                        // Skip the disk write when already unread (the mark
+                        // is a no-op) so a re-finishing session doesn't churn
+                        // the flock once per turn.
+                        let already_unread =
+                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                        if !is_live_target && !already_unread {
+                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
+                        }
                     }
                 }
             }
@@ -2592,13 +2649,12 @@ impl HomeView {
                     filtered_ids.insert(inst.id.clone());
                     continue;
                 };
-                // Defense-in-depth against the resume-fallback cascade: a sid
-                // the cascade just cleared can still live on disk for several
-                // minutes (opencode db, vibe meta.json, codex/gemini/pi/hermes
-                // state). The poller closures filter via `compose_exclusion`,
-                // but if a closure factory ever forgets to thread the per-
-                // instance excludes, this guard prevents the cleared sid from
-                // being re-imported into memory and disk.
+                // Defense-in-depth against explicit resume-target invalidation:
+                // an invalidated sid can still live on disk for several minutes
+                // (opencode db, vibe meta.json, codex/gemini/pi/hermes state).
+                // The poller closures filter via `compose_exclusion`, but if a
+                // closure factory ever forgets to thread the per-instance
+                // excludes, this guard prevents the sid from being re-imported.
                 if inst.retroactive_capture_excludes.contains(&session_id) {
                     tracing::debug!(
                         target: "tui.home",
@@ -2622,7 +2678,7 @@ impl HomeView {
         }
 
         let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>)> = Vec::new();
+        let mut to_rollback: Vec<(String, Option<String>, Option<String>)> = Vec::new();
 
         for (id, session_id, expected_prior) in &updates {
             let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
@@ -2645,7 +2701,11 @@ impl HomeView {
                     {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
+                                to_rollback.push((
+                                    id.clone(),
+                                    disk_inst.agent_session_id.clone(),
+                                    disk_inst.resume_probe_failed_sid.clone(),
+                                ));
                                 reloaded = true;
                             }
                         }
@@ -2670,19 +2730,22 @@ impl HomeView {
         for (id, session_id) in &to_apply {
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = Some(session_id.clone());
+                inst.resume_probe_failed_sid = None;
             });
         }
-        for (id, disk_sid) in &to_rollback {
+        for (id, disk_sid, disk_failed_sid) in &to_rollback {
             let disk_sid = disk_sid.clone();
+            let disk_failed_sid = disk_failed_sid.clone();
             self.mutate_instance(id, |inst| {
                 inst.agent_session_id = disk_sid.clone();
+                inst.resume_probe_failed_sid = disk_failed_sid.clone();
             });
         }
 
         let touched_ids: Vec<&str> = to_apply
             .iter()
             .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _)| id.as_str()))
+            .chain(to_rollback.iter().map(|(id, _, _)| id.as_str()))
             .chain(filtered_ids.iter().map(|s| s.as_str()))
             .collect();
         let mut set_batch: Vec<(String, String, String)> = Vec::new();
@@ -2768,13 +2831,13 @@ impl HomeView {
                                 "resumed",
                             );
                         }
-                        Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
                                 id = %instance_id,
                                 %title,
-                                %stale_sid,
-                                "restarted fresh after resume failure",
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
@@ -2815,56 +2878,163 @@ impl HomeView {
             self.recovery_in_flight.clear();
         }
         if touched {
-            self.instance_map = self
-                .instances
-                .iter()
-                .map(|i| (i.id.clone(), i.clone()))
-                .collect();
-            // Preserve the selection across the rebuild. Without this, a
-            // recovery completion that reorders rows under
-            // `SortOrder::LastActivity` (the recovered session's
-            // `last_start_time` shifted) would silently latch the
-            // selection onto a neighbour because `update_selected()`
-            // resolves through `flat_items[cursor]`. Mirrors the
-            // canonical sequence in `reload()`.
-            let prev_selected_session = self.selected_session.clone();
-            let prev_selected_group = self.selected_group.clone();
+            self.refresh_rows_preserving_selection();
+        }
+        touched
+    }
 
-            self.flat_items = self.build_flat_items();
+    /// Rebuild `instance_map` + `flat_items` after a background worker replaced
+    /// an `Instance` snapshot, preserving the current selection. Without the
+    /// selection restore, a completion that reorders rows (e.g. a shifted
+    /// `last_start_time` under `SortOrder::LastActivity`) would silently latch
+    /// the cursor onto a neighbour, since `update_selected()` resolves through
+    /// `flat_items[cursor]`. Mirrors the canonical sequence in `reload()`.
+    /// Shared by `apply_recovery_updates` and `apply_restart_results`.
+    fn refresh_rows_preserving_selection(&mut self) {
+        self.instance_map = self
+            .instances
+            .iter()
+            .map(|i| (i.id.clone(), i.clone()))
+            .collect();
+        let prev_selected_session = self.selected_session.clone();
+        let prev_selected_group = self.selected_group.clone();
 
-            let mut restored = false;
-            if let Some(ref sid) = prev_selected_session {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Session { id, .. } = item {
-                        if id == sid {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
-                    }
-                }
-            } else if let Some(ref gpath) = prev_selected_group {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Group { path, .. } = item {
-                        if path == gpath {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
+        self.flat_items = self.build_flat_items();
+
+        let mut restored = false;
+        if let Some(ref sid) = prev_selected_session {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Session { id, .. } = item {
+                    if id == sid {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
                     }
                 }
             }
-            if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
-                self.cursor = self.flat_items.len() - 1;
+        } else if let Some(ref gpath) = prev_selected_group {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Group { path, .. } = item {
+                    if path == gpath {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
             }
+        }
+        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
+            self.cursor = self.flat_items.len() - 1;
+        }
 
-            if self.search_active && !self.search_query.value().is_empty() {
-                self.update_search();
-            } else if !self.search_matches.is_empty() {
-                self.refresh_search_matches();
+        if self.search_active && !self.search_query.value().is_empty() {
+            self.update_search();
+        } else if !self.search_matches.is_empty() {
+            self.refresh_search_matches();
+        }
+
+        self.update_selected();
+    }
+
+    /// Apply results from the restart poller. Writes the post-cascade `Instance`
+    /// snapshot back into memory (so `restart_with_size`'s mutations and the
+    /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
+    /// and persists. A failed cascade or preserved resume-probe failure surfaces
+    /// as a "Restart Failed" dialog (the user explicitly initiated the restart).
+    /// Returns true if any instance changed.
+    pub fn apply_restart_results(&mut self) -> bool {
+        use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.restart_poller.try_recv_result() {
+                Ok(result) => {
+                    let crate::session::restart::RestartResult {
+                        session_id,
+                        before,
+                        mut instance,
+                        outcome,
+                    } = result;
+
+                    self.restart_in_flight.remove(&session_id);
+
+                    match outcome {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!(
+                                    "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                error = %e,
+                                "restart cascade failed",
+                            );
+                            instance.status = Status::Error;
+                            instance.last_error = Some(e.clone());
+                            // Surface it: a cascade failure now arrives async, so
+                            // the input handler's "Restart Failed" dialog can no
+                            // longer catch it (restart_selected_session returned
+                            // Ok once the work was enqueued).
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!("Could not restart session: {e}"),
+                            ));
+                        }
+                    }
+
+                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
+                        slot.merge_post_restart_with_baseline(&before, &instance);
+                        slot.last_error = if instance.status == Status::Error {
+                            instance.last_error.clone()
+                        } else {
+                            None
+                        };
+                        slot.last_error_check = instance.last_error_check;
+                        slot.last_start_time = instance.last_start_time;
+                        slot.retroactive_capture_excludes =
+                            instance.retroactive_capture_excludes.clone();
+                        touched = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The single worker thread is gone (a panic in
+                    // perform_restart dropped result_tx). Clear the in-flight set
+                    // defensively so the stuck rows fall back to the StatusPoller
+                    // (which marks them Error) instead of being filtered out of
+                    // polling forever by `pollable_instances`. Mirrors the
+                    // Disconnected handling in `apply_recovery_updates`.
+                    if !self.restart_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.restart",
+                            "restart poller worker gone; clearing in-flight set",
+                        );
+                        self.restart_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
             }
+        }
 
-            self.update_selected();
+        if touched {
+            self.refresh_rows_preserving_selection();
+            if let Err(e) = self.save() {
+                tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
+            }
         }
         touched
     }
@@ -4129,10 +4299,7 @@ impl HomeView {
     /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
     /// (`execute_action`) only has to clear its transient status.
     ///
-    /// Returns `Some(stale_sid)` when the resume-fallback cascade fired
-    /// during the implicit respawn so the caller can toast the user about
-    /// the lost history; `None` otherwise.
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) -> Option<String> {
+    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
         let target = std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
@@ -4145,25 +4312,26 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return;
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Send Failed",
                             &format!("Cannot prepare session: {}", err),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4173,9 +4341,8 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4183,12 +4350,17 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
         };
-        let inst = self.get_instance(session_id)?;
+        let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Session disappeared before the message could be sent.",
+            ));
+            return;
+        };
         let tmux_session = match target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
@@ -4198,7 +4370,7 @@ impl HomeView {
                             "Send Failed",
                             &format!("Failed to resolve session: {}", e),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -4221,7 +4393,7 @@ impl HomeView {
                 "Send Failed",
                 &format!("Failed to send message: {}", e),
             ));
-            return None;
+            return;
         }
         self.stamp_last_accessed(session_id);
         if let Err(e) = self.save() {
@@ -4231,7 +4403,6 @@ impl HomeView {
             self.select_top_attention(None);
             self.selected_session = None;
         }
-        stale_sid
     }
 
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
@@ -4270,11 +4441,9 @@ impl HomeView {
     /// the post-toast frame, and the agent's first capture rendered
     /// shifted up.
     ///
-    /// Returns `Ok(Some(stale_sid))` when the resume-fallback cascade
-    /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
-    /// if the pane could not be readied (`info_dialog` is set with the
-    /// underlying error so the caller only has to clear its toast).
-    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
+    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
+    /// set with the underlying error so the caller only has to clear its toast).
+    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
         let target = self.pending_live_send_target;
         self.pending_live_send_target = live_send::LiveSendTarget::Agent;
         let size = crate::terminal::get_size();
@@ -4291,20 +4460,21 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return Err(());
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Live send failed",
@@ -4322,7 +4492,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -4332,7 +4501,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
         };
         let inst = match self.get_instance(session_id) {
@@ -4441,6 +4609,9 @@ impl HomeView {
             exit_chords,
             leader,
         });
+        // Entering live-send means the user is now viewing this session, so
+        // clear any unread marker.
+        self.clear_unread_on_view(&inst.id);
         // Ensure the long-lived preview capture worker exists so we can hand
         // its waker to the send worker below. The worker isn't otherwise
         // spawned here (it follows the displayed pane for every view, not
@@ -4479,7 +4650,7 @@ impl HomeView {
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;
         self.stamp_last_accessed(session_id);
-        Ok(stale_sid)
+        Ok(())
     }
 
     /// Synchronously resize the live-send pane to match `self.preview_pane_area`,
@@ -4933,6 +5104,61 @@ impl HomeView {
         }
     }
 
+    /// Clear the unread marker because the user engaged with the session
+    /// (Tab into live-send, Enter to attach, or dwell on it in the list).
+    /// Runs regardless of the feature flag so a stale marker can't survive a
+    /// disable/re-enable and reappear later; only writes when the session is
+    /// actually unread, so an already-read session doesn't churn the storage
+    /// flock.
+    pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
+        let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
+        if is_unread {
+            let _ = self.apply_user_action(id, |i| i.mark_read());
+        }
+    }
+
+    /// Dwell-to-read: clear the selected session's unread marker once it has
+    /// stayed selected, with the list in the foreground, for `UNREAD_DWELL`.
+    /// This is what separates "scrolled past it" from "stopped to read it."
+    /// Driven from the app tick loop; returns true when it cleared a marker
+    /// (so the caller can request a redraw).
+    ///
+    /// The clock is suspended (and reset) whenever the feature is off, a
+    /// dialog or live-send is up (the list isn't being read then), or nothing
+    /// is selected, and it restarts whenever the selection moves to a
+    /// different row. `toggle_unread_at_cursor` also restarts it, so manually
+    /// re-flagging the current row isn't undone by the dwell on the very next
+    /// tick.
+    pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
+        if !crate::session::unread_enabled() || self.has_dialog() {
+            self.unread_dwell = None;
+            return false;
+        }
+        let Some(id) = self.selected_session.clone() else {
+            self.unread_dwell = None;
+            return false;
+        };
+        let started = match &self.unread_dwell {
+            Some((prev, started)) if *prev == id => *started,
+            // First tick on this row (or selection moved): start the clock.
+            _ => {
+                self.unread_dwell = Some((id, now));
+                return false;
+            }
+        };
+        if now.duration_since(started) < UNREAD_DWELL {
+            return false;
+        }
+        // Dwell satisfied. Clear if the row is unread; leave the clock parked
+        // on this row either way so we don't re-evaluate every tick (a manual
+        // re-flag resets it via `toggle_unread_at_cursor`).
+        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
+            self.clear_unread_on_view(&id);
+            return true;
+        }
+        false
+    }
+
     /// Bulk `apply_user_action`: one `Storage::update` per affected
     /// profile (single flock cycle), grouping ids by `source_profile`.
     pub(super) fn bulk_apply_user_action<F>(
@@ -5022,15 +5248,12 @@ impl HomeView {
     /// when `f` returns `Err`.
     ///
     /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume-fallback cascade mutates
-    /// `agent_session_id` and `retroactive_capture_excludes` BEFORE
-    /// returning `Err` on Tier-2 failure. The default `try_mutate_instance`
-    /// drops the mutated clone on `Err`, leaving the live entry with the
-    /// stale sid in memory while disk has been cleared. Subsequent restarts
-    /// then loop indefinitely on the same bad sid (the TUI's `reload()`
-    /// merge prefers in-memory, so even the 5s disk refresh does not
-    /// recover). This helper preserves the cascade's partial mutations so
-    /// the live state stays consistent with disk.
+    /// `ensure_pane_ready`, because the resume path can mutate
+    /// `agent_session_id`, `resume_probe_failed_sid`, and
+    /// `retroactive_capture_excludes` before returning `Err`. The default
+    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
+    /// state inconsistent with disk until a later reload. This helper keeps
+    /// the live state consistent with the attempted restart.
     pub(super) fn try_mutate_instance_writeback_on_err<T>(
         &mut self,
         id: &str,
@@ -5228,22 +5451,25 @@ impl HomeView {
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
-    /// Whether the project-view header `label` is backed by a registered
-    /// (pinned) project. A header with live sessions is pinned iff its own repo
-    /// path is in the registry, so two repos sharing a basename are judged
-    /// independently. An empty header exists only because a registered project
-    /// carries that basename, so it is pinned by construction (matched by
-    /// label). Used for the pin indicator and the pin toggle.
+    /// Whether the project-view header `label` is backed by a registered AND
+    /// pinned project. A registry entry is the "saved project"; the `pinned`
+    /// flag is the separate decision to keep its header visible (#2208), so a
+    /// saved-but-unpinned repo reads as not pinned (no glyph; the toggle pins
+    /// it). A header with live sessions is pinned iff its own repo path is a
+    /// pinned entry, so two repos sharing a basename are judged independently.
+    /// An empty header exists only because a pinned project carries that
+    /// basename, so the label match still requires the flag. Used for the pin
+    /// indicator and the pin toggle.
     pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
         match self.project_header_repo_path(label) {
             Some(path) => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+                .any(|p| p.pinned && crate::session::projects::canonical_key(&p.path) == path),
             None => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+                .any(|p| p.pinned && crate::session::projects::repo_label(&p.path) == label),
         }
     }
 
@@ -5479,6 +5705,7 @@ impl HomeView {
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
+        crate::session::set_unread_enabled(config.session.unread_indicator);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);

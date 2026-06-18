@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
+* [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
@@ -124,6 +125,7 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
+* `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `plugin` — Manage plugins (install, enable, disable, update)
@@ -303,6 +305,21 @@ Show session status summary
 * `-v`, `--verbose` — Show detailed session list
 * `-q`, `--quiet` — Only output waiting count (for scripts)
 * `--json` — Output as JSON
+
+
+
+## `aoe killall`
+
+Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+
+**Usage:** `aoe killall [OPTIONS]`
+
+###### **Options:**
+
+* `--timeout-secs <TIMEOUT_SECS>` — Grace period in seconds before force-killing agent workers. tmux sessions and the daemon use their own built-in grace
+
+  Default value: `5`
+* `--keep-daemon` — Leave the `aoe serve` daemon running; stop only workers and tmux sessions
 
 
 
@@ -959,7 +976,7 @@ Add a project to the registry
 
 ###### **Arguments:**
 
-* `<PATH>` — Path to the git repository
+* `<PATH>` — Path to the project directory: a git repository, or any directory to run sessions in place
 
 ###### **Options:**
 

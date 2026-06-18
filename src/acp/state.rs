@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::approvals::{Approval, ApprovalDecision, Nonce};
-use super::elicitations::{Elicitation, ElicitationOutcome};
+use super::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
 
 /// Identifier for a structured view session. Distinct from `SessionId` in
 /// `src/session/` because structured view sessions are a separate `SessionBackend`.
@@ -319,21 +319,31 @@ pub enum StartupErrorDetail {
         installed: String,
         required: String,
         install_command: String,
+        /// True when the web "Update & restart" action can install this
+        /// agent via `npm install -g`; false means the manual hint only.
+        #[serde(default)]
+        auto_install: bool,
     },
     MissingAgentInfo {
         expected_package: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     MismatchedAgentName {
         expected: String,
         received: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnparseableAgentVersion {
         package_name: String,
         raw_version: String,
         required: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnsupportedProtocolVersion {
         expected: String,
@@ -618,10 +628,15 @@ pub enum Event {
     },
     /// An elicitation was answered, skipped, cancelled, or torn down. The
     /// reducer drops the matching pending card. `outcome` records how it
-    /// ended for replay/debugging.
+    /// ended for replay/debugging. `answers` carries the user's submitted
+    /// answers (display-ready, in form order) so the transcript can show
+    /// what was picked after the card closes; empty for skip/cancel/teardown
+    /// and for events stored before #2209.
     ElicitationResolved {
         nonce: Nonce,
         outcome: ElicitationOutcome,
+        #[serde(default)]
+        answers: Vec<ElicitationAnswer>,
     },
     DiffEmitted {
         diff: DiffPreview,
@@ -841,6 +856,21 @@ pub enum Event {
     WakeupScheduled {
         at: DateTime<Utc>,
         reason: Option<String>,
+    },
+    /// The agent armed the Claude SDK's `Monitor` tool: a background watch
+    /// that streams events and re-invokes the agent off-protocol. Unlike
+    /// `ScheduleWakeup` it has no fixed wake time, so there is no countdown,
+    /// just a "monitoring" badge. The tool call is fire-and-forget (it
+    /// completes immediately while the watch keeps running), so the turn
+    /// ends and the session sits Idle while the monitor is still armed.
+    /// Emitted from `acp_client::map_update_to_events` so the sidebar can
+    /// flag the session without subscribing to the structured view WS.
+    /// Considered active until the next `UserPromptSent`: a monitor firing
+    /// re-invokes the agent with activity but never a `UserPromptSent`, so
+    /// the badge persists across re-fires and clears only when the user
+    /// takes over.
+    MonitorArmed {
+        description: Option<String>,
     },
     /// User invoked `/clear` (claude-agent-acp's reset-conversation
     /// slash command). The adapter rotates its internal session so the
@@ -1067,6 +1097,10 @@ impl AcpState {
             // in-memory mirror needed yet. Bumps seq so the WS replay
             // surfaces it to live clients.
             Event::WakeupScheduled { .. } => {}
+            // Like WakeupScheduled, the "monitor armed" state lives in the
+            // event log (queried by the REST endpoint); no in-memory mirror.
+            // Bumps seq so the WS replay surfaces it to live clients.
+            Event::MonitorArmed { .. } => {}
             // Rejected follow-up prompt while another prompt was in flight.
             // No durable in-memory mutation; the reducer surfaces a Retry
             // pill from the broadcast frame and the event_store entry

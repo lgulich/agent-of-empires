@@ -1,5 +1,6 @@
 import type { ProjectInfo, RepoGroup } from "./types";
 import type { RepoColor } from "./repoAppearance";
+import { workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Best-effort path key for matching a session-derived repo group against a
@@ -21,12 +22,14 @@ function isSyntheticRepoGroup(id: string): boolean {
 }
 
 // Attach registry metadata to the session-derived repo groups and append a
-// zero-workspace group for every registered project that has no live group
-// (a pinned-but-empty project). Pure so it can be unit-tested directly and
-// memoized in `useRepoGroups`.
+// zero-workspace group for every PINNED registered project that has no live
+// group. Saved-but-unpinned projects attach to a populated group if one
+// exists, but never produce a standalone empty header (#2208). Pure so it can
+// be unit-tested directly and memoized in `useRepoGroups`.
 //
 // A registered path that matches a populated group attaches to it (so the
-// group renders a pin marker) instead of producing a second empty header.
+// group renders a pin marker when pinned) instead of producing a second empty
+// header.
 // Registrations are grouped by normalized path, so the same repo registered
 // under both global and profile scope collapses into one group carrying both
 // (unpin removes every registration for the path). Synthetic Multi-repo /
@@ -65,6 +68,11 @@ export function mergeRegisteredProjects(
 
   for (const [key, registrations] of byKey) {
     if (seen.has(key)) continue;
+    // Only a pinned registration earns a sessionless sidebar header. A
+    // saved-but-unpinned project (the default for a project added via the
+    // Projects view / CLI) stays in the Projects view and the wizard but is
+    // not forced into the sidebar. See #2208.
+    if (!registrations.some((p) => p.pinned)) continue;
     const primary = registrations[0];
     if (!primary) continue;
     const defaultDisplayName = primary.path.split("/").pop() || primary.path;
@@ -85,4 +93,65 @@ export function mergeRegisteredProjects(
   }
 
   return merged;
+}
+
+// Saved (registered) projects that are NOT pinned and have no live session,
+// for the sidebar's dedicated "Projects" section (#2212). Pinned projects
+// render above as headers (via mergeRegisteredProjects), and a non-pinned
+// project that still has a live session renders above as its normal group, so
+// both are excluded here to avoid a duplicate row. Returns one zero-workspace
+// RepoGroup per path (scopes collapsed), carrying alias/color so a saved
+// project keeps its look. Pure for unit testing + memoization.
+export function unpinnedSavedProjects(
+  repoGroups: RepoGroup[],
+  projects: ProjectInfo[],
+  resolve?: {
+    alias: (repoPath: string) => string | null;
+    color: (repoPath: string) => RepoColor | null;
+  },
+): RepoGroup[] {
+  // Paths that already render above as a live group (a real repo with at least
+  // one non-sunk workspace). An all-sunk repo does not render above, so its
+  // saved project should still surface in the section.
+  const livePaths = new Set<string>();
+  for (const group of repoGroups) {
+    if (isSyntheticRepoGroup(group.id)) continue;
+    if (group.workspaces.some((ws) => !workspaceIsSunk(ws))) {
+      livePaths.add(normalizeProjectPathKey(group.repoPath));
+    }
+  }
+
+  const byKey = new Map<string, ProjectInfo[]>();
+  for (const project of projects) {
+    const key = normalizeProjectPathKey(project.path);
+    if (!key) continue;
+    const list = byKey.get(key);
+    if (list) list.push(project);
+    else byKey.set(key, [project]);
+  }
+
+  const out: RepoGroup[] = [];
+  for (const [key, registrations] of byKey) {
+    if (livePaths.has(key)) continue; // shown above as a live group
+    if (registrations.some((p) => p.pinned)) continue; // shown above as a pinned header
+    const primary = registrations[0];
+    if (!primary) continue;
+    const defaultDisplayName = primary.path.split("/").pop() || primary.path;
+    const alias = resolve?.alias(primary.path) ?? null;
+    out.push({
+      id: primary.path,
+      repoPath: primary.path,
+      displayName: alias ?? defaultDisplayName,
+      defaultDisplayName,
+      alias,
+      color: resolve?.color(primary.path) ?? null,
+      remoteOwner: null,
+      workspaces: [],
+      status: "idle",
+      collapsed: false,
+      registeredProjects: registrations,
+    });
+  }
+  out.sort((a, b) => a.displayName.localeCompare(b.displayName));
+  return out;
 }

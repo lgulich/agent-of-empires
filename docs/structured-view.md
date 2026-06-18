@@ -16,7 +16,7 @@ Contributors: see [Structured View Internals](development/internals/structured-v
 
 ## Supported agents
 
-aoe ships an ACP registry entry for each tool whose ACP server we've verified. For those tools the web wizard shows a per-session **Use structured view** toggle (on by default). Tools not in the set, and custom agents without an ACP command, have no toggle and always run in the terminal view.
+aoe ships an ACP registry entry for each tool whose ACP server we've verified. For those tools the web wizard shows a per-session **Use structured view** toggle (on by default), under the wizard's **More options** disclosure. Tools not in the set, and custom agents without an ACP command, have no toggle and always run in the terminal view.
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
@@ -54,7 +54,7 @@ Codex/opencode/gemini support is built from adapter docs and code reading rather
 The web new-session wizard is the primary path; no CLI needed.
 
 1. Run `aoe serve` and open the dashboard.
-2. Click **New session**, pick your project and agent, and leave **Use structured view** on.
+2. Click **New session**, pick your project and agent, and launch. Structured view is on by default; to confirm or change it, expand **More options** and leave **Use structured view** on.
 3. Open the session: you see the structured plan and tool-call cards instead of a terminal.
 
 The CLI is the optional path for scripting or headless launches. Unlike the wizard, `aoe add` defaults to the terminal view (matching the TUI):
@@ -94,6 +94,12 @@ Non-ACP tools always run in the terminal view, with no toggle.
 `--cmd <tool>` resolves through `session.agent_command_override` the same as terminal sessions, so an override like `opencode = "opencode-plannotator"` makes `--cmd opencode` launch `opencode-plannotator acp` (the required ACP args are preserved). Adapter-backed agents such as Claude use `session.agent_acp_cmd` for a full command swap instead. The wizard shows the resolved launch command read-only.
 
 `aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[session.acp_defaults.<agent>]`:
+
+When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from your first message using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+
+The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks a session that is still default-named and will be renamed on its first message, and a `Naming…` chip (pulsing dot) shows while the one-shot title call is in flight. The chips disappear once the session is renamed or if it is not eligible.
+
+Two chips flag a session that has parked itself but is still alive, so an agent waiting on background work does not read as a dead idle session. A `⏰` countdown shows when the agent scheduled a wakeup (a `ScheduleWakeup` call or a `/loop` run) and ticks down to the fire time. A `👁 monitoring` badge shows when the agent armed a `Monitor` (a background watch, for example waiting for a build or `cargo clippy` to finish); it has no fixed end time, so it stays put while the monitor keeps re-invoking the agent and clears once you send the session a new prompt.
 
 ```toml
 [session.acp_defaults.opencode]

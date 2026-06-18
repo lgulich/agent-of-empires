@@ -575,6 +575,130 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     );
 }
 
+/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
+/// status supersedes it, keeping its own spinner — so a Running session that
+/// also carries an unread marker must NOT show the solid unread dot. See the
+/// #2088 review note about jumbled precedence.
+#[test]
+#[serial]
+fn unread_dot_yields_to_a_running_status() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Idle + unread: the row shows the solid unread dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Running + still unread: the live status wins; no unread dot.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a running row must keep its spinner, not the unread dot"
+    );
+}
+
+/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
+/// (with the list in the foreground) is cleared, distinguishing "stopped to
+/// read it" from "scrolled past."
+#[test]
+#[serial]
+fn unread_dwell_clears_after_threshold() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // First tick arms the dwell clock; nothing cleared yet.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Below the threshold: still unread (this is the "scrolled past" guard).
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Past the threshold: cleared.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_millis(1)));
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+}
+
+/// Moving the selection to a different row before the dwell completes spares
+/// the first row: arrowing through a list doesn't read everything you pass.
+#[test]
+#[serial]
+fn unread_dwell_resets_on_selection_change() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+            inst.mark_unread();
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    let t0 = Instant::now();
+    // Arm the dwell clock on A.
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    // Move to B well before A's threshold; A's clock is dropped, B's arms.
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    // Long after, B has now dwelled past the threshold and clears; A, which we
+    // left early, is untouched.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(2)));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "row left before the threshold must stay unread"
+    );
+    assert!(
+        !env.view.get_instance(&b).unwrap().is_unread(),
+        "row dwelled past the threshold must be cleared"
+    );
+}
+
 #[test]
 #[serial]
 fn test_q_returns_quit_action() {
@@ -6064,6 +6188,236 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+#[test]
+#[serial]
+fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping: tmux not available");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile = "restart-resume-failed";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let stale_sid = "11111111-2222-3333-4444-555555555555";
+
+    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    inst.source_profile = profile.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "/bin/false".to_string();
+    inst.agent_session_id = Some(stale_sid.to_string());
+    let id = inst.id.clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    storage
+        .update(|instances, groups| {
+            *instances = vec![inst.clone()];
+            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some(profile.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.update_selected();
+    view.selected_session = Some(id.clone());
+
+    let result = view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+
+    let mut applied = false;
+    for _ in 0..120 {
+        if view.apply_restart_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    assert!(applied, "timed out waiting for async restart result");
+    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    assert_eq!(dialog.title(), "Restart Failed");
+    assert!(dialog.message().contains(stale_sid));
+    let row = view.get_instance(&id).expect("instance remains visible");
+    assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
+    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert!(row.last_accessed_at.is_some());
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_preserves_peer_sid_and_marker() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("peer-fresh-sid".to_string());
+    env.view.instances[0].resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+    let mut worker = env.view.instances[0].clone();
+    worker.status = crate::session::Status::Error;
+    worker.agent_session_id = Some("phase1-stale-sid".to_string());
+    worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
+    worker.last_error =
+        Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(worker.clone()),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::ResumeFailed {
+                sid: "phase1-stale-sid".to_string(),
+            }),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert_eq!(row.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+    assert_eq!(
+        row.resume_probe_failed_sid.as_deref(),
+        Some("peer-fresh-sid")
+    );
+    assert!(env.view.restart_in_flight.is_empty());
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("resume failure dialog");
+    assert!(dialog.message().contains("phase1-stale-sid"));
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_propagates_worker_sid_without_peer_write() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("sid-before".to_string());
+
+    let before = env.view.instances[0].clone();
+    let mut worker = before.clone();
+    worker.agent_session_id = Some("sid-after".to_string());
+    worker.status = crate::session::Status::Running;
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(before),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::Resumed),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
+    assert_eq!(row.resume_probe_failed_sid, None);
+    assert!(env.view.restart_in_flight.is_empty());
+}
+
+#[test]
+#[serial]
+fn execute_send_message_missing_session_shows_send_failed() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.instances.retain(|inst| inst.id != id);
+    env.view.instance_map.remove(&id);
+
+    env.view.execute_send_message(&id, "hello");
+
+    let dialog = env.view.info_dialog.as_ref().expect("send failure dialog");
+    assert_eq!(dialog.title(), "Send Failed");
+    assert_eq!(
+        dialog.message(),
+        "Session disappeared before the message could be sent."
+    );
+}
+
+/// A second restart press while the first cascade is still running on the
+/// poller worker must be dropped. The cascade is off the event loop, so the
+/// 1.5s keyboard-repeat debounce does not cover a deliberate press during a
+/// multi-second pull; without the in-flight guard the worker would enqueue a
+/// duplicate request and restart the row twice.
+#[test]
+#[serial]
+fn restart_selected_session_skips_when_already_in_flight() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "an in-flight restart must drop the press before any bookkeeping"
+    );
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Starting,
+        "the row must not be re-flipped to Starting by a dropped duplicate press"
+    );
+}
+
+/// Deleting a row whose restart cascade is still running would fire docker
+/// commands against the container the worker is mid-creating. The delete must
+/// be refused (and surfaced) rather than racing the restart worker.
+#[test]
+#[serial]
+fn delete_selected_refused_during_restart() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.delete_selected(&DeleteOptions::default());
+    assert!(result.is_ok());
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Deleting,
+        "delete must be refused while a restart is in flight"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refused delete must surface a dialog, not silently no-op"
+    );
+}
+
 /// Build a HomeView seeded with two distinct projects, each containing
 /// sessions with different attention statuses. Helper for the Project +
 /// Attention combination tests below.
@@ -6227,7 +6581,7 @@ fn pinned_project_without_sessions_shows_empty_header() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6282,9 +6636,17 @@ fn p_key_pins_project_on_header() {
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
 
-    // Unpinning (a second toggle) drops the registry entry.
+    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
+    // so the entry stays in the registry (only an explicit remove deletes it).
+    // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    // The specific entry is kept (not just "registry non-empty") with its pin
+    // flag cleared: unpin keeps the saved project, only Remove deletes it.
+    let after = crate::session::projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert_eq!(after[0].name, "alpha");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
 }
 
 /// Off a project header (here: in Manual grouping), `p` keeps its original
@@ -6421,10 +6783,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         .unwrap();
 
     // Stale registry entry: same basename, different (nonexistent) path.
+    // Pinned, so it surfaces as an empty header (#2208).
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        Project::new("otari", "/repos/otari", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6474,10 +6837,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         "unpin must drop the empty header from the main flow; got {:?}",
         view.flat_items
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "unpin must remove the stale registry entry"
-    );
+    // Unpin clears the flag but KEEPS the saved project (#2208): the entry
+    // survives, now unpinned, so it stays in the Projects view / wizard.
+    let after = projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
     // The archived session itself is untouched; it stays under Archived.
     assert!(
         view.flat_items
@@ -6648,7 +7012,7 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6707,7 +7071,7 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6730,10 +7094,13 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
         !view.is_project_label_pinned("lonely"),
         "lonely must read as unpinned after the toggle"
     );
-    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    // The unpin must clear the flag on beta's on-disk entry (not the default
+    // profile's), but KEEP the entry: it stays a saved project. See #2208.
+    let beta_after = projects::load_profile("beta").unwrap();
+    assert_eq!(beta_after.len(), 1, "the profile-scoped entry must be kept");
     assert!(
-        projects::load_profile("beta").unwrap().is_empty(),
-        "the profile-scoped registry entry must be removed from disk"
+        !beta_after[0].pinned,
+        "its pin flag must be cleared on disk"
     );
     let still: Vec<String> = view
         .flat_items
@@ -6751,9 +7118,10 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
 
 /// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
 /// `--allow-override`) must fully unpin in a single press. `load_merged` only
-/// surfaces the shadowing profile entry, so removing just that one would
-/// re-surface the global entry and leave the header pinned after a "success"
-/// dialog. Unpin sweeps every scope for the path.
+/// surfaces the shadowing profile entry, so clearing just that one would
+/// re-surface the global pin and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path, clearing the flag while
+/// keeping each entry. See #2208.
 #[test]
 #[serial]
 fn unpin_clears_both_global_and_profile_entries_for_a_path() {
@@ -6765,14 +7133,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
     projects::add(
         "test",
         ProjectScope::Profile,
-        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile).with_pinned(true),
         true,
     )
     .unwrap();
@@ -6797,14 +7165,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
         !env.view.is_project_label_pinned("dual"),
         "dual must read as unpinned after a single press"
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "global entry must be removed"
-    );
-    assert!(
-        projects::load_profile("test").unwrap().is_empty(),
-        "profile entry must be removed"
-    );
+    // Both entries are kept (saved projects), with the pin flag cleared in
+    // each scope so the merged view no longer shows a pinned header. See #2208.
+    let global_after = projects::load_global().unwrap();
+    assert_eq!(global_after.len(), 1, "global entry must be kept");
+    assert!(!global_after[0].pinned, "global pin flag must be cleared");
+    let profile_after = projects::load_profile("test").unwrap();
+    assert_eq!(profile_after.len(), 1, "profile entry must be kept");
+    assert!(!profile_after[0].pinned, "profile pin flag must be cleared");
     let names: Vec<String> = env
         .view
         .flat_items
@@ -11603,11 +11971,13 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (New Session / Rename /
-        // Archive / Snooze / Delete), so Delete is four Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename
+        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
+        // away. (Unread defaults on, so the "Mark unread" row is present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11691,9 +12061,19 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
-        // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just New Session / Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["New Session", "Rename", "Unarchive", "Delete"]);
+        // Default sort here is Newest, where Snooze is gated out. The unread
+        // toggle is always-on (any sort) and defaults on, so the archived-row
+        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        assert_eq!(
+            labels,
+            vec![
+                "New Session",
+                "Rename",
+                "Unarchive",
+                "Mark unread",
+                "Delete"
+            ]
+        );
 
         env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive

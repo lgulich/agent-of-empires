@@ -1,172 +1,140 @@
-import { useCallback, useEffect, useState } from "react";
-import { useTerminal } from "../hooks/useTerminal";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
-import { LiveTerminalView } from "./LiveTerminalView";
+import { useLiveTerminal } from "../hooks/useLiveTerminal";
+import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
+import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
+import { MobileLiveTerminal } from "./MobileLiveTerminal";
+import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import {
-  closePluginPane,
-  ensureTerminal,
-  fetchPlugins,
-  listPluginPanes,
-  openPluginPane,
-  type PluginPaneHandle,
-} from "../lib/api";
+import { LiveTerminalView } from "./LiveTerminalView";
+import { closePluginPane, fetchPlugins, listPluginPanes, openPluginPane, type PluginPaneHandle } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
-import {
-  FOCUS_TERMINAL_EVENT,
-  consumePendingTerminalFocus,
-  setPendingTerminalFocus,
-  type FocusTerminalDetail,
-} from "../lib/terminalFocus";
-import "@xterm/xterm/css/xterm.css";
 
 type ShellMode = "host" | "container";
 
-/** The paired (side-shell) xterm.js terminal, desktop only: touch
- *  devices render the capture-snapshot LiveTerminalView instead (see
- *  PairedShellPane), so this component carries no mobile machinery. */
-function PairedTerminal({ sessionId, mode }: { sessionId: string; mode: ShellMode }) {
-  const [ready, setReady] = useState(false);
-  const wsPath = mode === "container" ? "container-terminal/ws" : "terminal/ws";
-  const { containerRef, termRef, state, manualReconnect, activate, maxRetries } = useTerminal(
-    ready ? sessionId : null,
-    wsPath,
-    false,
-  );
-  const [termFocused, setTermFocused] = useState(false);
-  const [bootError, setBootError] = useState(false);
-  const [bootAttempt, setBootAttempt] = useState(0);
+/** A plugin-owned terminal pane rendered through the capture-snapshot live
+ *  view (same architecture as the agent and paired shells). The handle IS the
+ *  pane's tmux session, which the host already spawned at open time, so there
+ *  is no ensure/boot step: this connects directly to the absolute
+ *  `/api/plugin-panes/<handle>/ws` live relay. */
+function PluginPaneTerminal({ handle }: { handle: string }) {
+  const coarse = useIsCoarsePointer();
+  const live = useLiveTerminal(handle, `/api/plugin-panes/${handle}/ws`);
+  const { keyboardHeight } = useMobileKeyboard();
+  const [inputFocused, setInputFocused] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const [ctrlActive, setCtrlActive] = useState(false);
+  const ctrlActiveRef = useRef(false);
+  useEffect(() => {
+    ctrlActiveRef.current = ctrlActive;
+  }, [ctrlActive]);
 
   const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element?.querySelector("textarea");
-    if (ta instanceof HTMLElement) {
+    const ta = inputRef.current;
+    if (ta) {
       ta.focus();
       return true;
     }
     return false;
-  }, [termRef]);
+  }, []);
 
-  // Track effect key changes to reset ready/bootError during render
-  const effectKey = `${sessionId}-${mode}-${bootAttempt}`;
-  const [trackedEffectKey, setTrackedEffectKey] = useState(effectKey);
-  if (effectKey !== trackedEffectKey) {
-    setTrackedEffectKey(effectKey);
-    setReady(false);
-    setBootError(false);
-  }
+  const toggleKeyboard = useCallback(() => {
+    const ta = inputRef.current;
+    if (!ta) return;
+    if (inputFocused) ta.blur();
+    else ta.focus();
+  }, [inputFocused]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void ensureTerminal(sessionId, mode === "container")
-      .then((ok) => {
-        if (cancelled) return;
-        if (ok) {
-          setReady(true);
-        } else setBootError(true);
-      })
-      .catch(() => {
-        if (!cancelled) setBootError(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, mode, bootAttempt, focusSelf]);
-
-  // Drain a pending paired-focus latch only after `ready` flips and the
-  // terminal renders: while !ready the splash is shown and the xterm textarea
-  // is not mounted, so consuming the latch in the ensureTerminal callback
-  // would clear it before focusSelf() could find anything to focus.
-  useEffect(() => {
-    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (!ready) return;
-    if (consumePendingTerminalFocus("paired")) focusSelf();
-  }, [ready, focusSelf]);
-
-  // Returns true if focus was applied. Callers can fall back to the pending
-  // latch when the textarea isn't in the DOM yet (PTY still booting).
-  // Cmd+` shortcut focuses this terminal when "paired" is the dispatched
-  // target. The component might be mounted but its PTY not yet ready (the
-  // initial ensureTerminal round-trip), in which case focusSelf() can't
-  // find a textarea, so we latch the intent; the ensureTerminal callback
-  // drains the latch once the PTY boots. While the right panel is
-  // collapsed this component is unmounted entirely; App.tsx sets the latch
-  // directly in that case.
-  useEffect(() => {
-    const onFocusEvent = (e: Event) => {
-      const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
-      if (detail?.target !== "paired") return;
-      if (!focusSelf()) setPendingTerminalFocus("paired");
-    };
-    window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
-    return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
-  }, [focusSelf]);
-
-  if (bootError) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-2 bg-surface-950 text-text-dim">
-        <span className="text-xs text-status-error">Couldn't start the terminal.</span>
-        <button
-          onClick={() => setBootAttempt((n) => n + 1)}
-          className="text-xs text-brand-500 cursor-pointer underline"
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  if (!ready) {
-    return (
-      <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
-        <span className="text-xs">Starting terminal...</span>
-      </div>
-    );
-  }
+  const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-      <TerminalConnectionBanners
-        connected={state.connected}
-        reconnecting={state.reconnecting}
-        retryCount={state.retryCount}
-        retryCountdown={state.retryCountdown}
-        maxRetries={maxRetries}
-        onRetry={manualReconnect}
-      />
+    <div
+      className="flex-1 flex flex-col overflow-hidden relative"
+      style={rootStyle}
+      data-term="plugin-pane"
+      data-pane-focused={inputFocused || undefined}
+    >
       <div
-        data-term="paired"
-        className={`flex-1 overflow-hidden bg-[var(--term-bg)] relative term-panel${termFocused ? " term-focused" : ""}`}
-        onFocus={() => setTermFocused(true)}
-        onBlur={() => setTermFocused(false)}
-      >
-        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
-      </div>
-    </div>
-  );
-}
-
-/** A plugin-owned terminal pane: the host already spawned its tmux session at
- *  open time, so this attaches the xterm relay directly to the absolute
- *  /api/plugin-panes/{handle}/ws path (no ensureTerminal boot step). */
-function PluginPaneTerminal({ handle }: { handle: string }) {
-  const { containerRef, state, manualReconnect, activate, maxRetries } = useTerminal(
-    handle,
-    `/api/plugin-panes/${handle}/ws`,
-    false,
-  );
-  return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-      <TerminalConnectionBanners
-        connected={state.connected}
-        reconnecting={state.reconnecting}
-        retryCount={state.retryCount}
-        retryCountdown={state.retryCountdown}
-        maxRetries={maxRetries}
-        onRetry={manualReconnect}
+        aria-hidden="true"
+        className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
+          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+        }`}
       />
-      <div className="flex-1 overflow-hidden bg-[var(--term-bg)] relative term-panel">
-        <div ref={containerRef} className="absolute inset-0" onPointerDown={activate} />
+
+      <TerminalConnectionBanners
+        connected={live.state.connected}
+        reconnecting={live.state.reconnecting}
+        retryCount={live.state.retryCount}
+        retryCountdown={live.state.retryCountdown}
+        maxRetries={live.maxRetries}
+        onRetry={live.manualReconnect}
+      />
+
+      {live.state.connected && !live.state.isOwner && (
+        <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
+          <button
+            type="button"
+            onClick={live.claim}
+            data-live-takeover
+            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+            Live on another device. Take over
+          </button>
+        </div>
+      )}
+
+      <div
+        className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
+        onClick={() => {
+          if (coarse) return;
+          const sel = window.getSelection();
+          if (sel && !sel.isCollapsed) return;
+          focusSelf();
+        }}
+      >
+        <MobileLiveTerminal
+          frame={live.state.frame}
+          connected={live.state.connected}
+          active={true}
+          reading={live.state.reading}
+          sendResize={live.sendResize}
+          setWindow={live.setWindow}
+          setCadence={live.setCadence}
+          enterReading={live.enterReading}
+          returnToLive={live.returnToLive}
+          sendData={live.sendData}
+          forwardWheel={live.forwardWheel}
+          ctrlActiveRef={ctrlActiveRef}
+          clearCtrl={() => setCtrlActive(false)}
+          inputRef={inputRef}
+          onInputFocusChange={setInputFocused}
+          bottomAlign={false}
+        />
+        {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>
+
+      {coarse && live.state.connected && (
+        <MobileTerminalToolbar
+          sendData={live.sendData}
+          inputElRef={inputRef}
+          keyboardOpen={inputFocused}
+          ctrlActive={ctrlActive}
+          onCtrlToggle={() => setCtrlActive((v) => !v)}
+        />
+      )}
     </div>
   );
 }
@@ -179,9 +147,10 @@ interface DeclaredPane {
 }
 
 /** Host/container shell switch plus the paired terminal. Used both in the
- *  desktop right-panel split (`fullViewport={false}`) and as the promoted
- *  single full-viewport mobile pane (`fullViewport`). Plugin-owned panes
- *  (#268) appear as extra tabs alongside the shell. */
+ *  desktop right-panel split and as the promoted single full-viewport mobile
+ *  pane. Renders the capture-snapshot live view on every device (same
+ *  architecture as the agent pane); the xterm.js PTY relay was removed.
+ *  Plugin-owned panes (#268) appear as extra tabs alongside the shell. */
 export function PairedShellPane({ session, sessionId }: { session: SessionResponse | null; sessionId: string | null }) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   // `null` means a shell tab (host/container) is active; otherwise the active
@@ -191,9 +160,6 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
   const [openPanes, setOpenPanes] = useState<PluginPaneHandle[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const isSandboxed = session?.is_sandboxed ?? false;
-  // Touch devices get the capture-snapshot live view (same architecture
-  // as the agent pane); fine pointers keep the xterm PTY relay.
-  const coarse = useIsCoarsePointer();
 
   // Declared panes come from the active plugin set (global).
   useEffect(() => {
@@ -319,20 +285,18 @@ export function PairedShellPane({ session, sessionId }: { session: SessionRespon
         )}
       </div>
 
-      {!sessionId ? (
+      {!sessionId || !session ? (
         <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
           <p className="text-xs">Select a session</p>
         </div>
       ) : activePane ? (
         <PluginPaneTerminal key={activePane} handle={activePane} />
-      ) : coarse && session ? (
+      ) : (
         <LiveTerminalView
           key={`${sessionId}-${shellMode}`}
           session={session}
           surface={shellMode === "container" ? "paired-container" : "paired-host"}
         />
-      ) : (
-        <PairedTerminal key={`${sessionId}-${shellMode}`} sessionId={sessionId} mode={shellMode} />
       )}
     </div>
   );
