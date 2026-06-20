@@ -730,7 +730,7 @@ fn snapshot_carries_acp_interaction_counts() {
     assert_eq!(snap.agent_switches, 1);
     assert!(snap.plan_mode_seen);
     assert_eq!(snap.prompts_queued, 1);
-    // Schema version bumped for the v8 field set.
+    // Confirm the snapshot uses the current schema version.
     assert_eq!(snap.schema, telemetry::SCHEMA_VERSION);
 }
 
