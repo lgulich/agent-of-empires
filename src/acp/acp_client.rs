@@ -4208,6 +4208,12 @@ async fn run_connection_task<W, R>(
     // section stays synchronous and the guard never crosses an await.
     let agent_msg_dedup = Arc::new(std::sync::Mutex::new(AgentMessageDedup::default()));
     let agent_msg_dedup_for_notif = agent_msg_dedup.clone();
+    // The prompt loop resets the deduper at turn boundaries (a new prompt, and
+    // the turn's terminal Stopped). Turn completion is not a SessionUpdate, so
+    // without this an open text block could survive into the next turn and a
+    // new turn that legitimately reuses the prior turn's trailing text under a
+    // fresh message_id would be misclassified as a restatement. See #2281.
+    let agent_msg_dedup_for_block = agent_msg_dedup.clone();
 
     let result = Client
         .builder()
@@ -4898,6 +4904,13 @@ async fn run_connection_task<W, R>(
                 let cmd = cmd_rx.recv().await;
                 match cmd {
                     Some(ClientCmd::Prompt(blocks)) => {
+                        // Scope the agent-message deduper to one turn: a new
+                        // prompt starts a fresh assistant block, so forget any
+                        // block left open by the prior turn. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
                         // First user prompt after session/load: stop
                         // dropping notifications. The agent's history-
                         // replay window is over; everything from now on
@@ -5482,6 +5495,14 @@ async fn run_connection_task<W, R>(
                                 reason: reason.into(),
                             })
                             .await;
+                        // Turn ended: close any open assistant text block so a
+                        // restatement can never be matched across the turn
+                        // boundary. The next prompt also resets, this is the
+                        // belt to that suspenders. See #2281.
+                        agent_msg_dedup_for_block
+                            .lock()
+                            .expect("agent message dedup mutex poisoned")
+                            .reset();
                         if shutdown {
                             break;
                         }
