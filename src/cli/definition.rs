@@ -20,6 +20,7 @@ use super::logs::LogsArgs;
 use super::mcp::McpCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
+use super::register::RegisterArgs;
 use super::remove::RemoveArgs;
 use super::send::SendArgs;
 #[cfg(feature = "serve")]
@@ -68,6 +69,9 @@ pub struct Cli {
 pub enum Commands {
     /// Add a new session
     Add(Box<AddArgs>),
+
+    /// Adopt an existing tmux session (an agent you started yourself) into aoe
+    Register(RegisterArgs),
 
     /// List supported agents and their install status
     Agents,
@@ -227,6 +231,7 @@ pub enum Commands {
 /// `command_name` output is a member.
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
+    "register",
     "agents",
     "init",
     "list",
@@ -267,6 +272,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
 pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
+        Commands::Register(_) => "register",
         Commands::Agents => "agents",
         Commands::Init(_) => "init",
         Commands::List(_) => "list",
