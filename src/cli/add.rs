@@ -123,6 +123,10 @@ pub struct AddArgs {
     #[arg(long = "model")]
     model: Option<String>,
 
+    /// Initial prompt to inject into the session right after launch.
+    #[arg(long = "prompt")]
+    prompt: Option<String>,
+
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
     /// removed when the session is deleted (unless `aoe rm` is given
@@ -435,6 +439,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
+    if let Some(p) = args.prompt.as_ref() {
+        instance.initial_prompt = p.clone();
+    }
 
     // Scratch sessions: provision a fresh scratch directory keyed on the
     // freshly-generated instance id. The session layer owns the location
@@ -1016,6 +1023,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         "Session {} was removed by another process before launch could land; tmux session is now orphan",
                         instance.title
                     );
+                }
+
+                if let Err(e) = instance.inject_initial_prompt() {
+                    tracing::warn!(target: "automation", error = %e, "initial prompt injection failed");
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
