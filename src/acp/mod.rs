@@ -21,6 +21,8 @@ pub mod approvals;
 #[cfg(feature = "serve")]
 pub mod claude_import;
 pub mod client;
+#[cfg(feature = "serve")]
+pub mod codex_import;
 pub mod context_primer;
 pub mod elicitations;
 pub mod event_store;
