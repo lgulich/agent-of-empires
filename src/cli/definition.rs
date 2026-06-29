@@ -28,6 +28,7 @@ use super::send::SendArgs;
 #[cfg(feature = "serve")]
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
+use super::settings::SettingsCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
 use super::telemetry::TelemetryCommands;
@@ -138,7 +139,7 @@ pub enum Commands {
         command: GroupCommands,
     },
 
-    /// Manage plugins (list, info, enable, disable)
+    /// Manage plugins (list, info, enable, disable, install, update, uninstall)
     Plugin {
         #[command(subcommand)]
         command: PluginCommands,
@@ -178,6 +179,12 @@ pub enum Commands {
     Theme {
         #[command(subcommand)]
         command: ThemeCommands,
+    },
+
+    /// Inspect resolved settings and their provenance
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommands,
     },
 
     /// Manage anonymous opt-in usage telemetry
@@ -265,6 +272,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "tmux",
     "sounds",
     "theme",
+    "settings",
     "telemetry",
     "mcp",
     "serve",
@@ -311,6 +319,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",
         Commands::Theme { .. } => "theme",
+        Commands::Settings { .. } => "settings",
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
         #[cfg(feature = "serve")]
